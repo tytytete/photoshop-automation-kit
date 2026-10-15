@@ -1,0 +1,17 @@
+{
+  "create": { "width": 600, "height": 400, "resolution": 72, "name": "example", "mode": "rgb", "fill": "transparent" },
+  "output": {
+    "psd": "/path/to/out.psd",
+    "jpg": "/path/to/out.jpg"
+  },
+  "report": "/path/to/report.json",
+  "operations": [
+    { "op": "selectRect", "left": 0, "top": 0, "right": 600, "bottom": 400 },
+    { "op": "setForeground", "red": 230, "green": 120, "blue": 40 },
+    { "op": "fillSelection" },
+    { "op": "deselect" },
+    { "op": "dropShadow", "opacity": 60, "distance": 12, "size": 20, "color": [0, 0, 0] },
+    { "op": "text", "contents": "Hello", "size": 48, "color": [255, 255, 255], "name": "Title" },
+    { "op": "warpText", "style": "arc", "bend": 30 }
+  ]
+}

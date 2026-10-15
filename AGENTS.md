@@ -3,31 +3,45 @@
 ## tl;dr
 
 1. **Read `docs/API.md`** for the full function reference.
-2. **Produce a recipe JSX file** (never raw Action Manager code).
-3. **Run**: `./tools/run.sh <recipe.jsx>` (macOS).
+2. **Produce a recipe file** — either a JSON recipe (preferred) or a JSX recipe.
+3. **Run**: `./tools/run.sh recipe.json` (macOS).
 4. The recipe schema is documented in `src/recipe_runner.jsx` header comments.
 
 ## Exact invocation pattern (macOS)
 
+### JSON recipe (preferred)
+
 ```bash
-# Step 1 — Write the recipe to a temp file
+cat > /tmp/my_recipe.json << 'JSON'
+{
+  "create": { "width": 800, "height": 600, "resolution": 72, "mode": "rgb", "fill": "white" },
+  "output": { "psd": "/path/out.psd", "jpg": "/path/out.jpg" },
+  "report": "/path/report.json",
+  "operations": [
+    { "op": "brightnessContrast", "brightness": 45, "contrast": 20 },
+    { "op": "text", "contents": "Hello", "size": 48, "color": [255,255,255] },
+    { "op": "dropShadow", "opacity": 50, "distance": 8, "size": 16 }
+  ]
+}
+JSON
+
+./tools/run.sh /tmp/my_recipe.json
+# -> writes out.psd, out.jpg, and report.json (a PS.report() snapshot)
+```
+
+### JSX recipe (for complex logic)
+
+```bash
 cat > /tmp/my_recipe.jsx << 'JSX'
 #target photoshop
-
 var RECIPE = {
     input: '/path/to/input.jpg',
     output: { psd: '/path/to/output.psd', jpg: '/path/to/output.jpg' },
-    operations: [
-        { op: 'brightnessContrast', brightness: 45, contrast: 20 },
-        { op: 'curves', points: [[0,0],[60,44],[200,212],[255,255]] },
-        { op: 'savejpg', path: '/result.jpg' }
-    ]
+    operations: [ { op: 'brightnessContrast', brightness: 45, contrast: 20 } ]
 };
-
 RecipeRunner.run(RECIPE);
 JSX
 
-# Step 2 — Execute
 ./tools/run.sh /tmp/my_recipe.jsx
 ```
 
@@ -81,11 +95,19 @@ Every operation has an `op` string. Optional `name: string` renames the resultin
 | `threshold`            | `level`                      | `name`                             |
 | `invert`               |                              | `name`                             |
 | `solidColor`           | `red green blue`            | `name`                             |
+| `gradientFill`         | `style angle preset`        | `name`                             |
 | `text`                 | `contents`                   | `size font color position name`    |
+| `warpText`             | `style bend`                 | `horzDist vertDist`                |
 | `setOpacity`           | `value`                      |                                    |
 | `setBlendMode`         | `mode`                       |                                    |
-| `maskFromSelection`    |                              |                                    |
-| `invertMask`           |                              |                                    |
+| `maskFromSelection` / `revealAllMask` / `hideAllMask` / `invertMask` | | |
+| `dropShadow` / `innerShadow` / `outerGlow` / `innerGlow` / `colorOverlay` / `gradientOverlay` / `bevel` / `stroke` / `clearLayerStyle` | style-specific | see API.md |
+| `rectangle` / `roundedRect` / `ellipse` / `triangle` / `polygon` / `line` | `color` | `name` |
+| `smartObject` / `rasterize(type)` | | |
+| `rotateCanvas(angle)` / `flipCanvas(direction)` / `transformLayer({widthPct,heightPct,angle})` | | |
+| `gaussianBlur(radius)` / `motionBlur(angle,distance)` | | |
+| `fillSelection` / `smooth(radius)` / `selectBorder(radius)` / `colorRange(fuzziness)` | | |
+| `setForeground(r,g,b)` / `setBackground(r,g,b)` / `canvasSize(width,height)` | | |
 | `flatten`              |                              |                                    |
 
 ### When to use the raw library directly

@@ -190,8 +190,14 @@ var RecipeRunner = (function () {
             case 'solidColor':
                 PS.fill.solidColor(op);
                 break;
+            case 'gradientFill':
+                PS.fill.gradient(op);
+                break;
             case 'text':
                 PS.text.add(op);
+                break;
+            case 'warpText':
+                PS.text.warp(op);
                 break;
 
             // -- mask -----------------------------------------------
@@ -200,6 +206,103 @@ var RecipeRunner = (function () {
                 break;
             case 'invertMask':
                 PS.mask.invert(doc.activeLayer);
+                break;
+            case 'revealAllMask':
+                PS.mask.add(doc.activeLayer);
+                break;
+            case 'hideAllMask':
+                PS.mask.hide(doc.activeLayer);
+                break;
+
+            // -- v2: layer styles -----------------------------------
+            case 'dropShadow':
+                PS.layerStyle.dropShadow(op);
+                break;
+            case 'stroke':
+                PS.layerStyle.stroke(op);
+                break;
+            case 'innerShadow':
+                PS.layerStyle.innerShadow(op);
+                break;
+            case 'outerGlow':
+                PS.layerStyle.outerGlow(op);
+                break;
+            case 'innerGlow':
+                PS.layerStyle.innerGlow(op);
+                break;
+            case 'colorOverlay':
+                PS.layerStyle.colorOverlay(op);
+                break;
+            case 'gradientOverlay':
+                PS.layerStyle.gradientOverlay(op);
+                break;
+            case 'bevel':
+                PS.layerStyle.bevel(op);
+                break;
+            case 'clearLayerStyle':
+                PS.layerStyle.clearAll(doc.activeLayer);
+                break;
+
+            // -- v2: shapes -----------------------------------------
+            case 'rectangle':
+            case 'roundedRect':
+            case 'ellipse':
+            case 'triangle':
+            case 'polygon':
+            case 'line':
+                PS.shape[op.op](op);
+                break;
+
+            // -- v2: smart object / rasterize -----------------------
+            case 'smartObject':
+                PS.smartObject.convert();
+                break;
+            case 'rasterize':
+                PS.rasterize(doc.activeLayer, op.type);
+                break;
+
+            // -- v2: transform --------------------------------------
+            case 'rotateCanvas':
+                PS.transform.rotateCanvas(op.angle);
+                break;
+            case 'flipCanvas':
+                PS.transform.flipCanvas(op.direction);
+                break;
+            case 'transformLayer':
+                PS.transform.layer(op);
+                break;
+
+            // -- v2: filters ----------------------------------------
+            case 'gaussianBlur':
+                PS.filter.gaussianBlur(op.radius);
+                break;
+            case 'motionBlur':
+                PS.filter.motionBlur(op.angle, op.distance);
+                break;
+
+            // -- v2: selection fill / smooth / border / colorRange --
+            case 'fillSelection':
+                PS.selection.fill();
+                break;
+            case 'smooth':
+                PS.selection.smooth(op.radius || 5);
+                break;
+            case 'selectBorder':
+                PS.selection.border(op.radius || 5);
+                break;
+            case 'colorRange':
+                PS.selection.colorRange(op.fuzziness);
+                break;
+
+            // -- v2: color ------------------------------------------
+            case 'setForeground':
+                PS.color.setForeground(op.red, op.green, op.blue);
+                break;
+            case 'setBackground':
+                PS.color.setBackground(op.red, op.green, op.blue);
+                break;
+            case 'canvasSize':
+                PS.document.canvasSize(doc, op.width, op.height);
                 break;
 
             default:
@@ -210,14 +313,29 @@ var RecipeRunner = (function () {
     // Public API
     return {
         run: function (recipe) {
-            if (!recipe.input) throw 'Recipe must have "input" path';
-
-            var doc = PS.openDocument(recipe.input);
-            doc.activeLayer = doc.artLayers[0];
+            var doc;
+            if (recipe.create) {
+                // Recipe creates a brand-new document instead of opening input.
+                doc = PS.document.create(recipe.create);
+                doc.activeLayer = doc.artLayers[0];
+            } else {
+                if (!recipe.input) throw 'Recipe must have "input" path or "create" object';
+                doc = PS.openDocument(recipe.input);
+                doc.activeLayer = doc.artLayers[0];
+            }
 
             var ops = recipe.operations || [];
             for (var i = 0; i < ops.length; i++) {
                 runOp(ops[i], doc);
+            }
+
+            // Optional: emit a machine-readable report for the calling agent.
+            if (recipe.report) {
+                var rep = PS.report(doc);
+                var rf = File(recipe.report);
+                rf.open('w');
+                rf.write(PS.json(rep));
+                rf.close();
             }
 
             // Save outputs
@@ -231,7 +349,8 @@ var RecipeRunner = (function () {
                 PS.close(doc, false);
             }
 
-            return doc;
+            // Return a primitive so the AppleScript bridge can marshal it.
+            return 'OK';
         }
     };
 

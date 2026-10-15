@@ -1,12 +1,20 @@
 #!/bin/bash
-# Run a Photoshop JSX recipe from the command line (macOS).
-# The recipe file must `#target photoshop` and use the PS library.
+# Run a Photoshop recipe from the command line (macOS).
 #
-# Usage:
-#   ./tools/run.sh recipe.jsx
-#   ./tools/run.sh --recipe-src src/ps_core.jsx:src/recipe_runner.jsx --recipe recipes/my.jsx
+# Two input modes:
+#   1) JSX recipe file  ->  ./tools/run.sh recipes/example_recipe.jsx
+#      The file defines a global `RECIPE` and calls RecipeRunner.run(RECIPE).
 #
-# The script concatenates source files and sends them to Photoshop via osascript.
+#   2) JSON recipe file ->  ./tools/run.sh recipe.json
+#      A plain .json with { input|create, output, operations, ... } — the
+#      script wraps it automatically. This is the preferred mode for AI agents.
+#
+# Optional env vars:
+#   PS_APP  — Photoshop app name (default "Adobe Photoshop 2026")
+#   REPORT  — path to write a machine-readable document report (JSON)
+#
+# The script concatenates the core library + runner + your recipe and sends it
+# to Photoshop via the AppleScript bridge.
 
 set -euo pipefail
 
@@ -14,15 +22,13 @@ PS_APP="${PS_APP:-Adobe Photoshop 2026}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Default source files (concatenated before the recipe)
-CORE="${PROJECT_DIR}/src/ps_core.jsx"
-RUNNER="${PROJECT_DIR}/src/recipe_runner.jsx"
-
+CORE="${CORE:-$PROJECT_DIR/src/ps_core.jsx}"
+RUNNER="${RUNNER:-$PROJECT_DIR/src/recipe_runner.jsx}"
 TEMP_JSX="${TMPDIR:-/tmp}/ps_run_$$.jsx"
 
 usage() {
-    echo "Usage: run.sh [--core FILE] [--runner FILE] recipe.jsx"
-    echo "  Concatenates core + runner + recipe and executes in Photoshop."
+    echo "Usage: run.sh [--core FILE] [--runner FILE] recipe.jsx|recipe.json"
+    echo "  Env: PS_APP, REPORT"
     exit 1
 }
 
@@ -36,25 +42,37 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$RECIPE" ]]; then
-    usage
+[[ -z "$RECIPE" ]] && usage
+[[ -f "$RECIPE" ]] || { echo "ERROR: recipe file not found: $RECIPE"; exit 1; }
+
+# Detect JSON recipe and wrap it if needed.
+if [[ "$RECIPE" == *.json ]]; then
+    WRAP_START="#target photoshop\nvar RECIPE = "
+    WRAP_END=";\nif (REPORT && REPORT.length) RECIPE.report = REPORT;\nRecipeRunner.run(RECIPE);"
+    RECIPE_BODY="$(cat "$RECIPE")"
+else
+    WRAP_START=""
+    WRAP_END=""
+    RECIPE_BODY="$(cat "$RECIPE")"
 fi
 
-if [[ ! -f "$RECIPE" ]]; then
-    echo "ERROR: recipe file not found: $RECIPE"
-    exit 1
-fi
-
-# Concatenate: core + runner + recipe
+# Assemble and run.
 {
+    echo "#target photoshop"
     cat "$CORE"
     echo ""
     cat "$RUNNER"
     echo ""
-    cat "$RECIPE"
+    echo "var REPORT = \"${REPORT:-}\";"
+    if [[ "$RECIPE" == *.json ]]; then
+        printf "%b\n" "$WRAP_START"
+        echo "$RECIPE_BODY"
+        printf "%b\n" "$WRAP_END"
+    else
+        cat "$RECIPE"
+    fi
 } > "$TEMP_JSX"
 
-# Send to Photoshop
 osascript << EOF
 set js to read POSIX file "$TEMP_JSX" as «class utf8»
 tell application "$PS_APP"

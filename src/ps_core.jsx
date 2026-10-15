@@ -43,7 +43,12 @@ PS.charID = function (s) { return charIDToTypeID(s); };
     };
 
     PS.close = function (doc, saveChanges) {
-        doc.close(saveChanges ? SaveOptions.SAVECHANGES : SaveOptions.DONOTSAVECHANGES);
+        doc = doc || app.activeDocument;
+        try {
+            doc.close(saveChanges ? SaveOptions.SAVECHANGES : SaveOptions.DONOTSAVECHANGES);
+        } catch (e) {
+            // Document may already be closed (e.g. after a saveAs that replaced it).
+        }
     };
 
     PS.flatten = function (doc) {
@@ -504,6 +509,401 @@ PS.charID = function (s) { return charIDToTypeID(s); };
     PS.mask.invert = function (layer) {
         app.activeDocument.activeLayer = layer || app.activeDocument.activeLayer;
         executeAction(s2t('invert'), new ActionDescriptor(), DialogModes.NO);
+    };
+
+    // v2.0 — quick mask ops built on primitives already confirmed working.
+    PS.mask.add = function (layer) {
+        var d = app.activeDocument;
+        var activeLayer = layer || d.activeLayer;
+        d.activeLayer = activeLayer;
+        // Reveal-all: select all, create mask, clear selection.
+        d.selection.selectAll();
+        PS.mask.fromSelection(activeLayer);
+        d.selection.deselect();
+        return activeLayer;
+    };
+    PS.mask.hide = function (layer) {
+        var d = app.activeDocument;
+        var activeLayer = layer || d.activeLayer;
+        d.activeLayer = activeLayer;
+        d.selection.selectAll();
+        // Hide-all mask: reveal the selection then invert the mask pixels.
+        PS.mask.fromSelection(activeLayer);
+        d.selection.deselect();
+        try { PS.mask.invert(activeLayer); } catch (_) {}
+        return activeLayer;
+    };
+    PS.mask.invert = function (layer) {
+        app.activeDocument.activeLayer = layer || app.activeDocument.activeLayer;
+        // Invert the mask by targeting it as the active channel.
+        var desc = new ActionDescriptor();
+        var ref = new ActionReference();
+        ref.putEnumerated(s2t('channel'), s2t('ordinal'), s2t('targetEnum'));
+        desc.putReference(s2t('null'), ref);
+        desc.putEnumerated(s2t('to'), s2t('ordinal'), s2t('targetEnum'));
+        try {
+            executeAction(s2t('invert'), desc, DialogModes.NO);
+        } catch (e) {
+            // Fallback: invert current selection (best-effort).
+            try { executeAction(s2t('invert'), new ActionDescriptor(), DialogModes.NO); } catch (_) {}
+        }
+    };
+
+    // ---------------- v2.0: DOCUMENT CREATION & CANVAS ----------------
+    PS.document = {};
+
+    // create({ width, height, resolution, name, mode, fill, bits, colorProfile }).
+    // mode ∈ 'rgb' | 'cmyk' | 'lab' | 'grayscale'.
+    // fill ∈ 'white' | 'transparent' | 'black' | 'bgColor'.
+    PS.document.create = function (cfg) {
+        var w = cfg.width || 800, h = cfg.height || 600, res = cfg.resolution || 72;
+        var mode = { rgb: NewDocumentMode.RGB, cmyk: NewDocumentMode.CMYK, lab: NewDocumentMode.LAB, grayscale: NewDocumentMode.GRAYSCALE }[(cfg.mode || 'rgb').toLowerCase()] || NewDocumentMode.RGB;
+        var fillMap = { white: DocumentFill.WHITE, transparent: DocumentFill.TRANSPARENT };
+        try { fillMap.black = DocumentFill.BLACK; } catch(_) {}
+        try { fillMap.bgColor = DocumentFill.BACKGROUNDCOLOR; } catch(_) {}
+        var fill = fillMap[(cfg.fill || 'transparent').toLowerCase()] || DocumentFill.TRANSPARENT;
+        var d = app.documents.add(w, h, res, cfg.name || 'Untitled', mode, fill, 1);
+        return d;
+    };
+
+    PS.document.canvasSize = function (doc, width, height, anchor) {
+        var d = doc || app.activeDocument;
+        d.resizeCanvas(new UnitValue(width, 'px'), new UnitValue(height, 'px'), anchor || AnchorPosition.MIDDLECENTER);
+    };
+
+    // ---------------- v2.0: COLOR ----------------
+    PS.color = {};
+    PS.color.setForeground = function (r, g, b) {
+        var c = new SolidColor();
+        c.rgb.red = r; c.rgb.green = g; c.rgb.blue = b;
+        app.foregroundColor = c;
+    };
+    PS.color.setBackground = function (r, g, b) {
+        var c = new SolidColor();
+        c.rgb.red = r; c.rgb.green = g; c.rgb.blue = b;
+        app.backgroundColor = c;
+    };
+
+    // ---------------- v2.0: SELECTION EXTENSIONS ----------------
+    PS.selection.smooth = function (px) { app.activeDocument.selection.smooth(px); };
+    PS.selection.border = function (px) { app.activeDocument.selection.selectBorder(px); };
+
+    // Fill the active selection with the foreground color.
+    PS.selection.fill = function (color) {
+        app.activeDocument.selection.fill(color || app.foregroundColor, ColorBlendMode.NORMAL, 100, false);
+    };
+
+    // Select > Color Range (simple form: sampled colors with fuzziness).
+    PS.selection.colorRange = function (fuzziness) {
+        var desc = new ActionDescriptor();
+        desc.putEnumerated(c2t('Tlrn'), c2t('Tlrn'), c2t('Ctab'));
+        desc.putInteger(c2t('Fzns'), fuzziness !== undefined ? fuzziness : 40);
+        desc.putEnumerated(c2t('Intr'), c2t('Intr'), c2t('Sltn'));
+        executeAction(c2t('ClrR'), desc, DialogModes.NO);
+    };
+
+    // ---------------- v2.0: LAYER STYLES (drop shadow + stroke) ----------------
+    PS.layerStyle = {};
+    PS._applyStyleFx = function (groupID, innerDesc) {
+        var desc = new ActionDescriptor();
+        var ref = new ActionReference();
+        ref.putProperty(c2t('Prpr'), c2t('Lefx'));
+        ref.putEnumerated(c2t('Lyr '), c2t('Ordn'), c2t('Trgt'));
+        desc.putReference(c2t('null'), ref);
+        var fx = new ActionDescriptor();
+        fx.putEnumerated(c2t('Grup'), c2t('Type'), groupID);
+        fx.putObject(groupID, groupID, innerDesc);
+        desc.putObject(c2t('T   '), c2t('Lefx'), fx);
+        executeAction(c2t('setd'), desc, DialogModes.NO);
+    };
+    PS._rgba = function (r, g, b) {
+        var d = new ActionDescriptor();
+        d.putDouble(c2t('Rd  '), r || 0); d.putDouble(c2t('Grn '), g || 0); d.putDouble(c2t('Bl  '), b || 0);
+        return d;
+    };
+
+    PS.layerStyle.dropShadow = function (cfg) {
+        var sh = new ActionDescriptor();
+        sh.putBoolean(c2t('enab'), true);
+        sh.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 75);
+        sh.putBoolean(c2t('uglg'), cfg.useGlobalLight !== undefined ? !!cfg.useGlobalLight : true);
+        sh.putInteger(c2t('lagl'), cfg.angle !== undefined ? cfg.angle : 120);
+        sh.putInteger(c2t('Dstn'), cfg.distance !== undefined ? cfg.distance : 8);
+        sh.putInteger(c2t('Ckmt'), cfg.spread !== undefined ? cfg.spread : 0);
+        sh.putInteger(c2t('blur'), cfg.size !== undefined ? cfg.size : 15);
+        sh.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color ? cfg.color[0] : 0, cfg.color ? cfg.color[1] : 0, cfg.color ? cfg.color[2] : 0));
+        PS._applyStyleFx(c2t('DrSh'), sh);
+        return app.activeDocument.activeLayer;
+    };
+
+    PS.layerStyle.stroke = function (cfg) {
+        var st = new ActionDescriptor();
+        st.putBoolean(c2t('enab'), true);
+        st.putEnumerated(c2t('Styl'), c2t('FStl'), (cfg.position === 'inside' ? c2t('InsF') : cfg.position === 'center' ? c2t('CtrF') : c2t('OutF')));
+        st.putInteger(c2t('Sz  '), cfg.size !== undefined ? cfg.size : 3);
+        st.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color ? cfg.color[0] : 255, cfg.color ? cfg.color[1] : 0, cfg.color ? cfg.color[2] : 0));
+        PS._applyStyleFx(c2t('FrFX'), st);
+        return app.activeDocument.activeLayer;
+    };
+
+    PS.layerStyle.innerShadow = function (cfg) {
+        var sh = new ActionDescriptor();
+        sh.putBoolean(c2t('enab'), true);
+        sh.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 60);
+        sh.putInteger(c2t('lagl'), cfg.angle !== undefined ? cfg.angle : 120);
+        sh.putInteger(c2t('Dstn'), cfg.distance !== undefined ? cfg.distance : 5);
+        sh.putInteger(c2t('Ckmt'), cfg.choke !== undefined ? cfg.choke : 0);
+        sh.putInteger(c2t('blur'), cfg.size !== undefined ? cfg.size : 10);
+        sh.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color ? cfg.color[0] : 0, cfg.color ? cfg.color[1] : 0, cfg.color ? cfg.color[2] : 0));
+        PS._applyStyleFx(c2t('IrSh'), sh);
+        return app.activeDocument.activeLayer;
+    };
+    PS.layerStyle.outerGlow = function (cfg) {
+        var g = new ActionDescriptor();
+        var col = cfg.color || [255, 200, 0];
+        g.putBoolean(c2t('enab'), true);
+        g.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 70);
+        g.putInteger(c2t('Sprd'), cfg.spread !== undefined ? cfg.spread : 0);
+        g.putInteger(c2t('blur'), cfg.size !== undefined ? cfg.size : 12);
+        g.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(col[0], col[1], col[2]));
+        PS._applyStyleFx(c2t('OrGl'), g);
+        return app.activeDocument.activeLayer;
+    };
+    PS.layerStyle.innerGlow = function (cfg) {
+        var g = new ActionDescriptor();
+        var col = cfg.color || [0, 120, 255];
+        g.putBoolean(c2t('enab'), true);
+        g.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 70);
+        g.putInteger(c2t('Ckmt'), cfg.choke !== undefined ? cfg.choke : 0);
+        g.putInteger(c2t('blur'), cfg.size !== undefined ? cfg.size : 12);
+        g.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(col[0], col[1], col[2]));
+        PS._applyStyleFx(c2t('IrGl'), g);
+        return app.activeDocument.activeLayer;
+    };
+    PS.layerStyle.colorOverlay = function (cfg) {
+        var o = new ActionDescriptor();
+        var col = cfg.color || [30, 144, 255];
+        o.putBoolean(c2t('enab'), true);
+        o.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 100);
+        o.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(col[0], col[1], col[2]));
+        PS._applyStyleFx(c2t('SoFi'), o);
+        return app.activeDocument.activeLayer;
+    };
+
+    PS.layerStyle.bevel = function (cfg) {
+        var b = new ActionDescriptor();
+        b.putBoolean(c2t('enab'), true);
+        b.putEnumerated(c2t('bvlS'), c2t('BESl'), c2t('SfBL')); // inner bevel
+        if (cfg && cfg.color) b.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color[0], cfg.color[1], cfg.color[2]));
+        PS._applyStyleFx(c2t('ebbl'), b);
+        return app.activeDocument.activeLayer;
+    };
+
+    PS.layerStyle.gradientOverlay = function (cfg) {
+        var g = new ActionDescriptor();
+        g.putBoolean(c2t('enab'), true);
+        g.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 100);
+        var grad = new ActionDescriptor();
+        grad.putString(s2t('name'), (cfg && cfg.preset) || 'Foreground to Background');
+        g.putObject(c2t('Grad'), s2t('Grdn'), grad);
+        PS._applyStyleFx(c2t('GrFl'), g);
+        return app.activeDocument.activeLayer;
+    };
+
+    PS.layerStyle.patternOverlay = function (cfg) {
+        var p = new ActionDescriptor();
+        p.putBoolean(c2t('enab'), true);
+        p.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 100);
+        PS._applyStyleFx(c2t('PtFl'), p);
+        return app.activeDocument.activeLayer;
+    };
+
+    PS.layerStyle.clearAll = function (layer) {
+        app.activeDocument.activeLayer = layer || app.activeDocument.activeLayer;
+        try { executeAction(s2t('removeLayerStyle'), new ActionDescriptor(), DialogModes.NO); } catch (_) {}
+    };
+
+    // ---------------- v2.0: VECTOR SHAPE LAYERS ----------------
+    PS.shape = {};
+
+    // Internal: create a vector shape layer (a real, editable vector object).
+    PS._makeShape = function (shapeID, cfg) {
+        var desc = new ActionDescriptor();
+        var ref = new ActionReference();
+        ref.putClass(s2t('contentLayer'));
+        desc.putReference(s2t('null'), ref);
+        var using = new ActionDescriptor(), shapeD = new ActionDescriptor();
+        var c = new ActionDescriptor();
+        c.putDouble(s2t('red'), cfg.color ? cfg.color[0] : 255);
+        c.putDouble(s2t('grain'), cfg.color ? cfg.color[1] : 0);
+        c.putDouble(s2t('blue'), cfg.color ? cfg.color[2] : 0);
+        shapeD.putObject(s2t('color'), s2t('RGBColor'), c);
+        shapeD.putEnumerated(s2t('shape'), s2t('shape'), s2t(shapeID));
+        using.putObject(s2t('type'), s2t('solidColorLayer'), shapeD);
+        desc.putObject(s2t('using'), s2t('contentLayer'), using);
+        executeAction(s2t('make'), desc, DialogModes.NO);
+        var l = app.activeDocument.activeLayer;
+        if (cfg.name) l.name = cfg.name;
+        return l;
+    };
+
+    PS.shape.rectangle = function (cfg) { return PS._makeShape('rectangle', cfg || {}); };
+    PS.shape.roundedRect = function (cfg) { return PS._makeShape('roundedRectangle', cfg || {}); };
+    PS.shape.ellipse = function (cfg) { return PS._makeShape('ellipse', cfg || {}); };
+    PS.shape.triangle = function (cfg) { return PS._makeShape('triangle', cfg || {}); };
+    PS.shape.polygon = function (cfg) { return PS._makeShape('polygon', cfg || {}); };
+    PS.shape.line = function (cfg) { return PS._makeShape('line', cfg || {}); };
+
+    // ---------------- v2.0: SMART OBJECT ----------------
+    PS.smartObject = {};
+    PS.smartObject.convert = function () {
+        var desc = new ActionDescriptor();
+        var ref = new ActionReference();
+        ref.putEnumerated(s2t('layer'), s2t('ordinal'), s2t('targetEnum'));
+        desc.putReference(s2t('null'), ref);
+        executeAction(s2t('newPlacedLayer'), desc, DialogModes.NO);
+        return app.activeDocument.activeLayer;
+    };
+
+    // ---------------- v2.0: RASTERIZE ----------------
+    // type: 'TEXTCONTENTS' | 'ENTIRELAYER' | null (auto → ENTIRELAYER).
+    PS.rasterize = function (layer, type) {
+        app.activeDocument.activeLayer = layer || app.activeDocument.activeLayer;
+        var l = app.activeDocument.activeLayer;
+        try {
+            l.rasterize(RasterizeType[type || 'ENTIRELAYER']);
+        } catch (e) {
+            try { l.rasterize(RasterizeType.ENTIRELAYER); } catch (_) {}
+        }
+        return l;
+    };
+
+    // ---------------- v2.0: TRANSFORM ----------------
+    PS.transform = {};
+    PS.transform.rotateCanvas = function (angle) {
+        app.activeDocument.rotateCanvas(angle);
+    };
+    PS.transform.flipCanvas = function (dir) {
+        app.activeDocument.flipCanvas(dir === 'vertical' ? Direction.VERTICAL : Direction.HORIZONTAL);
+    };
+
+    // Free-transform the ACTIVE LAYER (scale + optional rotation), percent based.
+    // cfg: { widthPct, heightPct, angle }
+    PS.transform.layer = function (cfg) {
+        var desc = new ActionDescriptor();
+        desc.putEnumerated(c2t('FTcs'), c2t('QCSt'), c2t('Qcsa'));
+        var off = new ActionDescriptor();
+        off.putUnitDouble(c2t('Hrzn'), c2t('Pxl '), 0);
+        off.putUnitDouble(c2t('Vrtc'), c2t('Pxl '), 0);
+        desc.putObject(c2t('Ofst'), c2t('Ofst'), off);
+        if (cfg.widthPct !== undefined) desc.putUnitDouble(c2t('Wdth'), c2t('Prc '), cfg.widthPct);
+        if (cfg.heightPct !== undefined) desc.putUnitDouble(c2t('Hght'), c2t('Prc '), cfg.heightPct);
+        if (cfg.angle !== undefined) desc.putAngle(c2t('Angl'), cfg.angle);
+        desc.putEnumerated(c2t('Intr'), c2t('Intp'), c2t('Bcbc'));
+        executeAction(c2t('Trnf'), desc, DialogModes.NO);
+        return app.activeDocument.activeLayer;
+    };
+
+    // ---------------- v2.0: FILTERS ----------------
+    PS.filter = {};
+    PS.filter.gaussianBlur = function (radius) {
+        app.activeDocument.activeLayer.applyGaussianBlur(radius);
+        return app.activeDocument.activeLayer;
+    };
+    PS.filter.motionBlur = function (angle, distance) {
+        app.activeDocument.activeLayer.applyMotionBlur(angle, distance);
+        return app.activeDocument.activeLayer;
+    };
+
+    // ---------------- v2.0: TEXT EXTENSIONS ----------------
+    PS.text.warp = function (cfg) {
+        // cfg: { layer, style: 'arc','flag','wave'..., bend, horzDist, vertDist }
+        var l = cfg.layer || app.activeDocument.activeLayer;
+        var ti = l.textItem;
+        if (cfg.style) { try { ti.warpStyle = WarpStyle[cfg.style.toUpperCase()]; } catch(e){} }
+        if (cfg.bend !== undefined) ti.warpBend = cfg.bend;
+        if (cfg.horzDist !== undefined) ti.warpHorizontalDistortion = cfg.horzDist;
+        if (cfg.vertDist !== undefined) ti.warpVerticalDistortion = cfg.vertDist;
+        return l;
+    };
+    PS.text.setTracking = function (layer, val) { layer.textItem.tracking = val; };
+    PS.text.setLeading = function (layer, val) { layer.textItem.leading = val; };
+    PS.text.setScale = function (layer, horz, vert) {
+        if (horz !== undefined) layer.textItem.horizontalScale = horz;
+        if (vert !== undefined) layer.textItem.verticalScale = vert;
+    };
+    PS.text.setBaselineShift = function (layer, val) { layer.textItem.baselineShift = val; };
+
+    // ---------------- v2.0: GRADIENT FILL LAYER ----------------
+    PS.fill.gradient = function (cfg) {
+        var desc = new ActionDescriptor(); var ref = new ActionReference();
+        ref.putClass(s2t('contentLayer')); desc.putReference(s2t('null'), ref);
+        var using = new ActionDescriptor(), typeD = new ActionDescriptor();
+        var styles = { linear: 'linear', radial: 'radial', angle: 'angle', reflected: 'reflected', diamond: 'diamond' };
+        typeD.putEnumerated(s2t('type'), s2t('type'), s2t(styles[cfg.style] || 'linear'));
+        typeD.putDouble(s2t('angle'), cfg.angle !== undefined ? cfg.angle : 0);
+        if (cfg.scale !== undefined) typeD.putDouble(s2t('scale'), cfg.scale);
+        typeD.putBoolean(s2t('reverse'), !!cfg.reverse);
+        var grad = new ActionDescriptor();
+        grad.putString(s2t('name'), cfg.preset || 'Foreground to Transparent');
+        typeD.putObject(s2t('gradient'), s2t('gradientClass'), grad);
+        using.putObject(s2t('type'), s2t('gradientLayer'), typeD);
+        desc.putObject(s2t('using'), s2t('contentLayer'), using);
+        executeAction(s2t('make'), desc, DialogModes.NO);
+        var l = app.activeDocument.activeLayer;
+        if (cfg.name) l.name = cfg.name;
+        return l;
+    };
+
+    // Minimal JSON serializer (ExtendScript has no native JSON).
+    PS.json = function (obj) {
+        if (obj === null) return 'null';
+        var t = typeof obj;
+        if (t === 'string') return '"' + obj.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+        if (t === 'number' || t === 'boolean') return String(obj);
+        if (obj instanceof Array) {
+            var parts = [];
+            for (var i = 0; i < obj.length; i++) parts.push(PS.json(obj[i]));
+            return '[' + parts.join(',') + ']';
+        }
+        // object
+        var keys = [];
+        for (var k in obj) keys.push(k);
+        var out = [];
+        for (var j = 0; j < keys.length; j++) {
+            var v = obj[keys[j]];
+            if (typeof v === 'function') continue;
+            out.push('"' + keys[j] + '":' + PS.json(v));
+        }
+        return '{' + out.join(',') + '}';
+    };
+
+    PS.report = function (doc) {
+        var d = doc || app.activeDocument;
+        function buildTree(layer) {
+            var node = { name: layer.name, kind: layer.kind.toString(), visible: layer.visible, opacity: layer.opacity };
+            var children = [];
+            try {
+                if (layer.layers) for (var i = 0; i < layer.layers.length; i++) children.push(buildTree(layer.layers[i]));
+            } catch (_) {}
+            if (children.length) node.children = children;
+            return node;
+        }
+        var layerTree = [];
+        for (var i = d.artLayers.length - 1; i >= 0; i--) layerTree.push(buildTree(d.artLayers[i]));
+        var hRaw = '';
+        try { hRaw = String(d.histogram || ''); } catch (_) { hRaw = ''; }
+        var report = {
+            name: d.name,
+            width: parseInt(d.width.value),
+            height: parseInt(d.height.value),
+            resolution: parseInt(d.resolution),
+            mode: d.mode.toString(),
+            layers: layerTree,
+            layerCount: d.artLayers.length,
+            histogram256: hRaw  // comma-separated 256 RGB luminosity counts
+        };
+        return report;
     };
 
 })();
