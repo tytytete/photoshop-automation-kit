@@ -328,3 +328,169 @@ New `op` tokens: `create` (document), `gradientFill`, `warpText`, `dropShadow`, 
 
 Recipe can now start from a new document via `"create": {...}` (instead of `"input"`),
 and emit a report via `"report": "/path/report.json"`.
+
+---
+
+# v3.0 Additions
+
+The v3 surface lives in `src/ps_core_v3.jsx` and is loaded automatically by
+`run.sh` after `ps_core.jsx`. Every v2 function still works unchanged.
+
+## Setup, guarding and logging
+
+### `PS.setup(opts?) → version`
+
+Call once at the top of any script. It:
+
+- sets `app.displayDialogs = DialogModes.NO` — **without this a failing Action
+  raises a native modal alert that blocks the AppleScript bridge forever**
+  (the classic 120 s timeout + manual kill);
+- forces `rulerUnits = Units.PIXELS` and `typeUnits = TypeUnits.POINTS`;
+- optionally sets the log file (`opts.logPath`).
+
+### `PS.safe(label, fn, path?) → result | null`
+
+Runs `fn()`; on error logs it and returns `null` instead of throwing. Use it
+around any risky AM/DOM call so a failure never pops a dialog.
+
+### `PS.log(msg, path?)` / `PS.logError(label, err, path?)`
+
+Append a line to the log file (defaults to `PS.logPath`).
+
+## Units
+
+### `PS.unit.pathScale(doc?) → factor`
+= `doc.resolution / 72`. **Path-item anchors are stored in points** and scaled
+to pixels by this factor, so a shape placed at "100" on a 150 ppi document lands
+at 208 px unless converted. `PS.vector.*` converts for you.
+
+| function | meaning |
+|---|---|
+| `PS.unit.px(v)` | `UnitValue(v,'px')` |
+| `PS.unit.pxToPt(v, doc?)` | pixels → points |
+| `PS.unit.ptToPx(v, doc?)` | points → pixels |
+| `PS.unit.mmToPx(v, res?)` / `cmToPx` / `inToPx` | physical → px |
+| `PS.unit.pxToMm(v, res?)` / `pxToCm` | px → physical |
+
+## Documents
+
+### `PS.document.createSize(cfg) → Document`
+```javascript
+PS.document.createSize({ width: 100, height: 100, unit: 'cm', resolution: 150,
+                         mode: 'rgb', fill: 'white', name: 'Logo' });
+PS.document.createSize({ width: 210, height: 297, unit: 'mm', resolution: 300,
+                         mode: 'cmyk' });            // A4 for print
+```
+`unit` ∈ `px | mm | cm | in` (default `px`).
+
+## Colour
+
+```javascript
+PS.color.hexToRgb('#2D4A3E');   // -> [45,74,62]
+PS.color.of('#2D4A3E');         // -> SolidColor   (also accepts [r,g,b])
+```
+
+## Vector shapes — `PS.vector.*`
+
+**Use these instead of `PS.shape.*`.** The legacy helpers create full-canvas
+shapes that cannot be transformed (`transformLayer` errors; `resize`/`translate`
+hang the app). `PS.vector.*` builds a real, editable shape layer at exact pixel
+coordinates via a temporary work path.
+
+### `PS.vector.create(cfg) → Layer`
+```javascript
+PS.vector.create({
+  points: [[1450,3360],[2950,2060],[4450,3360]],   // or {anchor,left,right,smooth}
+  closed: true,                                     // default true
+  color: '#2D4A3E',                                 // or [r,g,b]
+  name: 'MunteFata'
+});
+```
+
+| call | notes |
+|---|---|
+| `PS.vector.rect(l,t,r,b,cfg)` | rectangle at exact bounds |
+| `PS.vector.roundedRect(l,t,r,b,radius,cfg)` | bezier rounded rectangle |
+| `PS.vector.circle(cx,cy,r,cfg)` | true 4-point bezier circle |
+| `PS.vector.polygon(cx,cy,r,sides,cfg)` | `cfg.rotation` in degrees |
+| `PS.vector.triangle(cx,cy,r,cfg)` | `polygon(...,3)` |
+| `PS.vector.line(x1,y1,x2,y2,thickness,cfg)` | thin filled quad |
+
+Curved points: `{ anchor:[x,y], left:[x,y], right:[x,y], smooth:true }`.
+
+### `PS.shape.*` upgrade
+`rectangle`, `roundedRect`, `ellipse`, `triangle` now honour
+`cfg.bounds = [l,t,r,b]` (and `cfg.radius`). Without `bounds` they fall back to
+the legacy full-canvas behaviour.
+
+## Text
+
+### `PS.text.addAt(cfg) → Layer`
+```javascript
+PS.text.addAt({ contents: 'MENIU', sizePx: 70, font: 'Arial-BoldMT',
+                color: '#2D4A3E', x: 1240, y: 1270,
+                justify: 'center', name: 'Titlu' });
+```
+`x`/`y` are **document pixels**; `sizePx` is pixels (or use `size` in points).
+`justify` ∈ `left|center|right`. `PS.text.add` now also accepts `'#rrggbb'`.
+
+### `PS.text.bounds(layer) → {left,top,right,bottom,width,height}` (px)
+### `PS.text.sizePx(px, doc?) → pt`
+### `PS.text.arc(layer, bend)`
+
+## Layout — `PS.layout.*`
+
+### `PS.layout.flow(cfg) → [{layer, bounds, baselineY}, …]`
+Places lines one under another; each next baseline is derived from the
+**measured** bounds of the previous line, so overlap is impossible.
+```javascript
+PS.layout.flow({
+  x: 420, y: 1500, sizePx: 36, font: 'ArialMT', color: '#243830',
+  gap: 12,
+  items: ['Espresso', 'Cappuccino', { text: 'Latte', sizePx: 48 }]
+});
+```
+
+### `PS.layout.next(layer, gap?) → { y, bounds }`
+
+## Export
+
+### `PS.export(doc, { psd, jpg, png, jpgQuality })`
+### `PS.export.auto(doc, basePath, quality?) → { psd, jpg }`
+
+Writes **PSD + JPG** together — the layered source is never forgotten.
+
+```javascript
+var doc = PS.document.createSize({ width:100, height:100, unit:'cm', resolution:150 });
+/* … drawing … */
+PS.export.auto(doc, '/tmp/logo');   // -> /tmp/logo.psd + /tmp/logo.jpg
+```
+
+## Introspection
+
+- `PS.layer.list(doc?) → [{name, kind, visible, opacity}, …]` (top → bottom)
+- `PS.layer.bounds(name, doc?) → {left,top,right,bottom,width,height}`
+
+## Recipe runner v3
+
+New ops: `vectorShape`, `circle`, `rect`/`rectAt`, `roundedRectAt`, `polygonAt`,
+`triangleAt`, `vectorLine`, `textAt`, `textStack`, `export`, `exportAuto`.
+New fields: `create.unit`, `log`, `summary`, `autoPsd`, `onError`.
+
+The runner sets up the hang-proof preamble itself, isolates every operation
+(failures are logged, the run continues unless `onError:'stop'`), returns
+`'OK: N ops, M errors'`, and writes a machine-readable summary when `summary`
+is given.
+
+## Known ExtendScript pitfalls
+
+1. **Aliasing breaks `this`.** `var s2t = app.stringIDToTypeID; s2t('x')` throws
+   *"global.stringIDToTypeID() … not getting correct parameters"*. Use
+   `PS.typeID` / `PS.charID` (they close over `app`).
+2. **`name` is reserved.** A top-level `var name = …` throws
+   *"undefined is not an object"*. Rename the variable.
+3. **Failed calls without `displayDialogs=NO` hang the bridge.** Always
+   `PS.setup()` first and prefer `PS.safe()`.
+4. **`$.writeln` goes nowhere** under `do javascript`; log to a file with
+   `PS.log`.
+5. **CMYK JPEGs** are exported with 4 components — expected for print output.

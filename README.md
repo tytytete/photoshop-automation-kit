@@ -4,6 +4,11 @@ A reusable, AI-friendly ExtendScript library for automating Adobe Photoshop from
 
 Tested on **Photoshop 2021–2026** (macOS).
 
+> **v3.0 is out** — hang-proof guarding, `PS.vector.*` shapes that land at exact
+> coordinates, unit conversion (cm/mm/px/pt), measured text layout, and
+> guaranteed PSD export. See [CHANGELOG.md](CHANGELOG.md) and
+> [docs/API.md → v3.0 Additions](docs/API.md#v30-additions).
+
 ---
 
 ## Installation
@@ -18,16 +23,20 @@ The library lives at:
 
 ```
 ~/Documents/photoshop-automation-kit/
-├── AGENTS.md          ← the file AI models must read
-├── README.md          ← this file (for humans)
-├── docs/API.md        ← full function reference
+├── AGENTS.md              ← the file AI models must read (has the v3 hard rules)
+├── README.md              ← this file (for humans)
+├── CHANGELOG.md           ← release notes
+├── VERSION
+├── docs/API.md            ← full function reference incl. v3
 ├── src/
-│   ├── ps_core.jsx    ← the library (~80 functions, PS.* namespace)
-│   └── recipe_runner.jsx  ← declarative recipe engine
+│   ├── ps_core.jsx        ← the library (~80 functions, PS.* namespace)
+│   ├── ps_core_v3.jsx     ← v3 ergonomic extensions (loaded automatically)
+│   └── recipe_runner.jsx  ← declarative, hang-proof recipe engine
 ├── tools/
-│   └── run.sh         ← one-command runner (macOS)
-├── recipes/           ← example recipes (.json and .jsx)
-└── examples/          ← full task examples
+│   └── run.sh             ← one-command runner with a watchdog (macOS)
+├── recipes/               ← example recipes (.json and .jsx)
+├── examples/              ← full task examples (logo + menu)
+└── tests/                 ← self-test (run_tests.sh)
 ```
 
 **Prerequisites**
@@ -80,12 +89,49 @@ So your prompt to the AI can look like:
 
 The model will:
 
-- read `AGENTS.md` (the recipe JSON whitelist),
+- read `AGENTS.md` (the recipe JSON whitelist + v3 hard rules),
 - generate a `.json` recipe,
 - run `./tools/run.sh recipe.json`,
-- optionally read the machine-readable `report.json` output.
+- optionally read the machine-readable `report.json` / `summary` output.
 
 You never paste the library code into the chat again — you just point the model at the path.
+
+---
+
+## What v3 fixes (for AI agents)
+
+| failure | v3 fix |
+|---|---|
+| Photoshop hangs on a modal error dialog forever | `PS.setup()` disables dialogs; `PS.safe()` isolates risks; `run.sh` watchdog (`--timeout`) |
+| Vector shapes come out full-canvas and can't be moved | `PS.vector.*` builds shapes at exact px coordinates |
+| mm / px / pt confusion makes geometry "float" | `PS.unit.*` + `PS.document.createSize({unit:'cm'})` |
+| Text lines stack on top of each other | `PS.layout.flow()` advances from measured bounds |
+| PSD source is dropped after exporting a JPG preview | `PS.export.auto()` + runner `autoPsd: true` |
+
+A complete v3 recipe:
+
+```bash
+cat > /tmp/logo_recipe.json << 'JSON'
+{
+  "create": { "width": 100, "height": 100, "unit": "cm", "resolution": 150,
+              "mode": "rgb", "fill": "white", "name": "Logo" },
+  "output": { "jpg": "/tmp/logo.jpg" },
+  "autoPsd": true,
+  "operations": [
+    { "op": "circle", "cx": 2953, "cy": 2953, "r": 2400, "color": "#2D4A3E", "name": "Ring" },
+    { "op": "vectorShape", "points": [[1450,3360],[2950,2060],[4450,3360]],
+      "color": "#2D4A3E", "name": "Peak" },
+    { "op": "textAt", "contents": "CAFENEUA MONTANĂ", "sizePx": 235,
+      "font": "Arial-BoldMT", "color": "#2D4A3E", "x": 2953, "y": 4750,
+      "justify": "center", "name": "Name" }
+  ]
+}
+JSON
+
+./tools/run.sh /tmp/logo_recipe.json      # -> logo.psd + logo.jpg
+```
+
+Self-check the kit with `tests/run_tests.sh`.
 
 ---
 
@@ -144,6 +190,7 @@ See `recipes/` and `examples/` for runnable samples.
 |---|---|
 | `PS_APP` | Override Photoshop app name (default `Adobe Photoshop 2026`) |
 | `REPORT` | Write a machine-readable report to this path |
+| `PS_TIMEOUT` | Watchdog seconds before a stuck run is killed (default 300, `0` = off) |
 
 ---
 
