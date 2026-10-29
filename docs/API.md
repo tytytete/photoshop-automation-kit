@@ -1,7 +1,9 @@
 # API Reference
 
-All functions live under the global `PS` namespace, defined in `src/ps_core.jsx`.  
-Load order: `ps_core.jsx` first, then call any function.
+All functions live under the global `PS` namespace, defined in `src/ps_core.jsx`
+and extended by `src/ps_core_v3.jsx` (the v4 ergonomic surface).
+Load order: `ps_core.jsx` first, then `ps_core_v3.jsx`. `run.sh` does this
+automatically.
 
 ---
 
@@ -482,6 +484,142 @@ The runner sets up the hang-proof preamble itself, isolates every operation
 `'OK: N ops, M errors'`, and writes a machine-readable summary when `summary`
 is given.
 
+# v4.0 Additions
+
+`PS.VERSION` is `4.0.0`. The v3 file (`src/ps_core_v3.jsx`) still holds the
+ergonomic extensions; the name is kept for backwards compatibility.
+
+**Vector fix:** `PS.vector.circle()` / `roundedRect()` are now truly round.
+Photoshop's path-point `leftDirection` is the outgoing tangent, so the kit
+swaps the geometric left/right handles. Custom `{anchor,left,right,smooth}`
+points inherit the fix.
+
+## Masks — fixed and extended
+
+### `PS.mask.fromSelection(layer?) → Layer`
+Creates a mask from the current selection on a normal, text, fill or
+adjustment layer. It is safe to call on a layer that already has a mask: the
+existing mask is replaced (no second pixel mask is created). With no active
+selection it falls back to `PS.mask.add()`.
+
+```javascript
+PS.selection.selectSubject();
+PS.mask.fromSelection(doc.activeLayer);       // pixel mask, subject revealed
+PS.selection.deselect();
+```
+
+### `PS.mask.has(layer?) → boolean`
+True when the layer currently owns a user (pixel) mask. Note: Photoshop gives
+fill/adjustment/text layers an internal mask, so this is often `true` even
+before you mask anything.
+
+### `PS.mask.add(layer?)` / `PS.mask.hide(layer?)`
+Reveal-all (white) / hide-all (black). If a mask already exists it is reset;
+otherwise a new one is created.
+
+### `PS.mask.invert(layer?)`
+Inverts the existing mask.
+
+### `PS.mask.target(layer?)` / `PS.mask.exitTarget()`
+Switch the active channel to the layer mask / back to the composite RGB
+channel. Use this when a third-party snippet needs to edit the mask pixels
+directly.
+
+### `PS.mask.linearGradient(layer, start, end, feather?, opts?) → Layer`
+Paints a soft linear falloff into the active layer mask without the Gradient
+tool (which raises error 8800 on PS 2024–2026). `start` is the 50% boundary,
+`|end - start|` is the default feather width and its sign picks the direction.
+
+```javascript
+PS.mask.linearGradient(layer, 500, 900, 200);                  // vertical fade
+PS.mask.linearGradient(layer, 0, 400, 120, { direction:'horizontal', reveal:true });
+```
+
+`opts.direction` = `'vertical'` (default) | `'horizontal'`;
+`opts.reveal` = `true` paints white instead of black. Alias:
+`PS.mask.gradient`.
+
+## Locale-safe gradients
+
+`PS.fill.gradient(cfg)` and `PS.layerStyle.gradientOverlay(cfg)` never pass a
+localized preset name to Photoshop. They build explicit RGB + transparency
+stops.
+
+```javascript
+PS.fill.gradient({ style:'linear', angle:0, from:'#1040ff', to:'#ffcc00', name:'Ramp' });
+PS.fill.gradient({ style:'radial', colors:[
+    { color:'#ffffff', location:0 },
+    { color:'#0000ff', location:1, opacity:50 }
+]});
+PS.layerStyle.gradientOverlay({ opacity:60, from:'#00ff00', to:'#ffff00' });
+```
+
+`cfg.preset` is accepted only as a hint: `'foreground to transparent'`,
+`'foreground to background'`, `'black, white'`.
+
+## Selection ergonomics
+
+`doc.selection.selectRect(l,t,r,b,feather?)` and
+`doc.selection.selectOval(l,t,r,b,feather?)` now work in addition to
+`PS.selection.*`. They are patched onto each document's selection object when
+you use `PS.openDocument`, `PS.document.create`, `PS.document.createSize`, or
+`PS.setup`. `selectOval` creates a true 64-point ellipse.
+
+Feathering is applied in two steps (select hard → `selection.feather()`),
+which is reliable when the target is a layer mask.
+
+## Type-ID helpers
+
+`PS.s2t(id)` / `PS.c2t(id)` are exposed, and `s2t` / `c2t` are also available
+as globals in recipes and `-e` snippets.
+
+## Logging and stdout
+
+`PS.setup()` hooks `$.writeln` into `PS.log()`. Every log line is buffered and
+optionally appended to `PS.logPath`. `run.sh` appends a `PS.finish()` call, so
+the run result and all logs are printed on stdout.
+
+```javascript
+$.writeln('hello');                     // appears in the terminal
+PS.log('to file too', '/tmp/run.log');
+PS.getLogOutput();                      // buffered text
+PS.finish();                            // PS._result + buffered logs
+```
+
+## Layer utilities
+
+| function | notes |
+|---|---|
+| `PS.layer.duplicate(layer?, newName?, invisible?)` | duplicate, rename, hide the copy |
+| `PS.layer.unlockBackground(doc?)` | turn Background into a normal layer |
+| `PS.layer.moveToBottom(layer?, doc?)` | move to the bottom of the stack |
+| `PS.layer.list(doc?)` | **top → bottom** (fixed in v4) |
+| `PS.layer.bounds(name, doc?)` | measured pixel box |
+
+## CLI — `tools/run.sh`
+
+```bash
+./tools/run.sh recipe.json             # JSON recipe
+./tools/run.sh recipe.jsx              # JSX recipe
+./tools/run.sh -e '$.writeln(app.version);'   # inline probe
+./tools/run.sh --version
+```
+
+`#include "src/ps_core.jsx"` (and the v3/runner includes) are stripped
+automatically, and `Folder.current` is pointed at the recipe's directory so
+relative paths such as `File('out.jpg')` resolve there.
+
+## Recipe ops added in v4
+
+| op | params |
+|---|---|
+| `maskGradient` / `maskLinearGradient` | `startY`/`start`, `endY`/`end`, `feather`, `direction`, `reveal` |
+| `maskTarget` / `maskExitTarget` | — |
+| `duplicateLayer` | `name`, `invisible` |
+| `unlockBackground` | — |
+| `moveToBottom` | — |
+| `log` | `message` (or `text`) |
+
 ## Known ExtendScript pitfalls
 
 1. **Aliasing breaks `this`.** `var s2t = app.stringIDToTypeID; s2t('x')` throws
@@ -491,6 +629,12 @@ is given.
    *"undefined is not an object"*. Rename the variable.
 3. **Failed calls without `displayDialogs=NO` hang the bridge.** Always
    `PS.setup()` first and prefer `PS.safe()`.
-4. **`$.writeln` goes nowhere** under `do javascript`; log to a file with
-   `PS.log`.
-5. **CMYK JPEGs** are exported with 4 components — expected for print output.
+4. **`$.writeln` is captured by v4.** It reaches stdout through
+   `PS.finish()`; use `PS.log` when you also need a file. If you call the
+   library without `run.sh`, call `PS.getLogOutput()` yourself.
+5. **`Selection.select(..., feather, ...)` is unreliable for mask fills.**
+   Select hard, then call `selection.feather()`. The kit helpers already do.
+6. **`revealSelection` / `revealAll` masks can come out inverted** on some
+   builds. The v4 mask helpers avoid those enums and write pixel values
+   explicitly.
+7. **CMYK JPEGs** are exported with 4 components — expected for print output.

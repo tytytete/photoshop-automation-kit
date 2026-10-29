@@ -1,9 +1,11 @@
 // =============================================================================
-//  PS CORE v3 — ergonomic, hang-proof extensions for AI agents
+//  PS CORE v4 — ergonomic, hang-proof extensions for AI agents
 //  -----------------------------------------------------------------------------
-//  Load AFTER ps_core.jsx (same global PS namespace).
+//  Load AFTER ps_core.jsx (same global PS namespace). The file name
+//  ps_core_v3.jsx is kept for backwards compatibility with custom run.sh
+//  invocations.
 //
-//  v3 fixes the five failure classes an agent actually hits:
+//  v3 fixed the five failure classes an agent hits:
 //
 //    1. MODAL ERROR DIALOGS HANG THE BRIDGE
 //       A failing Action/DOM call pops a native alert that blocks the
@@ -11,33 +13,47 @@
 //       -> PS.setup() disables dialogs; PS.safe() isolates every risky call.
 //
 //    2. HAND-ROLLED ActionDescriptors FOR VECTOR SHAPES
-//       Writing "Mk > contentLayer + pathClass + subpathListKey" by hand is
-//       50 fragile lines and easy to typo.
 //       -> PS.vector.create() / .rect() / .circle() / .polygon() ...
 //
 //    3. MILLIMETRE / PIXEL / POINT CONFUSION
-//       Path anchors are in POINTS and get scaled by resolution/72; text size
-//       is in points while text position is in the current ruler unit.
 //       -> PS.unit.* auto-converts; PS.document.createSize({unit:'cm'}).
 //
 //    4. BLIND TYPOGRAPHIC LAYOUT (text stacking on top of itself)
-//       No visual feedback means hand-guessed Y offsets overlap.
 //       -> PS.text.addAt() + PS.layout.flow() advance from measured bounds.
 //
 //    5. PSD SOURCE FORGOTTEN
-//       The agent exports only a JPG preview and loses the layered source.
 //       -> PS.export.auto() and the recipe runner's auto-PSD.
+//
+//  v4 adds: logging buffer + $.writeln capture (PS.finish), Selection ergonomic
+//  patching (doc.selection.selectRect / selectOval), and the PS.layer utilities
+//  (duplicate / unlockBackground / moveToBottom). See CHANGELOG.md.
 // =============================================================================
 #target photoshop
 
 var PS = PS || {};
-PS.VERSION = '3.0.0';
+PS.VERSION = '4.0.0';
 
 // -----------------------------------------------------------------------------
 //  Logging & guards
 // -----------------------------------------------------------------------------
 
 PS.logPath = null;
+PS._logs = PS._logs || [];
+PS._result = null;
+
+// `do javascript` only returns the script's final expression — it does NOT
+// forward $.writeln to stdout. Capture writes into an in-memory buffer so
+// run.sh can return them (PS.finish()).
+PS._installConsoleHook = function () {
+    if (PS._writelnHooked) return;
+    try {
+        PS._origWriteln = $.writeln;
+        $.writeln = function (msg) { PS.log(msg); };
+        PS._writelnHooked = true;
+    } catch (e) {
+        // Host may forbid replacing $.writeln; PS.log still buffers.
+    }
+};
 
 // Call once at the top of every script. Returns the version string.
 PS.setup = function (opts) {
@@ -48,19 +64,44 @@ PS.setup = function (opts) {
     try { app.preferences.rulerUnits = Units.PIXELS; } catch (e) {}
     try { app.preferences.typeUnits = TypeUnits.POINTS; } catch (e) {}
     if (opts.logPath) PS.logPath = opts.logPath;
+    // v4: native Selection gains selectRect/selectOval; $.writeln is captured.
+    if (PS.patchSelection) {
+        try {
+            for (var i = 0; i < app.documents.length; i++) PS.patchSelection(app.documents[i]);
+        } catch (e) {}
+    }
+    PS._installConsoleHook();
     return PS.VERSION;
 };
 
 PS.log = function (msg, path) {
+    msg = String(msg);
+    // Always keep a copy for the CLI/stdout bridge.
+    PS._logs.push(msg);
     var p = path || PS.logPath;
     if (!p) return false;
     try {
         var f = File(p);
+        try { f.lineFeed = 'Unix'; } catch (e) {}
         f.open('a');
-        f.writeln(String(msg));
+        f.write(msg + '\n');
         f.close();
         return true;
     } catch (e) { return false; }
+};
+
+// The full buffered console, one line per entry.
+PS.getLogOutput = function () {
+    return PS._logs.join('\n');
+};
+
+// run.sh footer: explicit result first, then captured logs, as one string.
+PS.finish = function () {
+    var parts = [];
+    if (PS._result !== null && PS._result !== undefined) parts.push(String(PS._result));
+    var logs = PS.getLogOutput();
+    if (logs) parts.push(logs);
+    return parts.join('\n');
 };
 
 PS.logError = function (label, e, path) {
@@ -168,8 +209,12 @@ PS.vector._pt = function (def, scale) {
     var p = new PathPointInfo();
     p.kind = smooth ? PointKind.SMOOTHPOINT : PointKind.CORNERPOINT;
     p.anchor = [a[0] * scale, a[1] * scale];
-    p.leftDirection = [l[0] * scale, l[1] * scale];
-    p.rightDirection = [r[0] * scale, r[1] * scale];
+    // Photoshop's leftDirection is the outgoing tangent and rightDirection the
+    // incoming one (opposite of the geometric left/right used in our point
+    // definitions). Swapping here makes circles/rounded rects round instead of
+    // diamonds; corner points are unaffected (left == right == anchor).
+    p.leftDirection = [r[0] * scale, r[1] * scale];
+    p.rightDirection = [l[0] * scale, l[1] * scale];
     return p;
 };
 
@@ -257,7 +302,9 @@ PS.vector.roundedRect = function (l, t, r, b, rad, cfg) {
     var k = 0.5522847498 * rad;
     function P(ax, ay, lx, ly, rx, ry) { return { anchor: [ax, ay], left: [lx, ly], right: [rx, ry], smooth: true }; }
     cfg.points = [
-        P(l, t + rad, l, t + rad - k, l + k, t + rad),
+        // First point lives on the left edge: incoming from below, outgoing
+        // into the top-left arc (upward). The old handles created a notch.
+        P(l, t + rad, l, t + rad + k, l, t + rad - k),
         P(l + rad, t, l + rad - k, t, l + rad + k, t),
         P(r - rad, t, r - rad - k, t, r - rad + k, t),
         P(r, t + rad, r, t + rad - k, r, t + rad + k),
@@ -440,10 +487,11 @@ PS.export.auto = function (doc, basePath, quality) {
 PS.layer = PS.layer || {};
 
 // List {name, kind, visible, opacity} of the top-level art layers, top -> bottom.
+// In the DOM artLayers[0] is the topmost layer.
 PS.layer.list = function (doc) {
     doc = doc || app.activeDocument;
     var out = [];
-    for (var i = doc.artLayers.length - 1; i >= 0; i--) {
+    for (var i = 0; i < doc.artLayers.length; i++) {
         var l = doc.artLayers[i];
         out.push({ name: l.name, kind: String(l.kind), visible: l.visible, opacity: l.opacity });
     }
@@ -455,4 +503,44 @@ PS.layer.bounds = function (name, doc) {
     doc = doc || app.activeDocument;
     var l = doc.artLayers.getByName(name);
     return PS.text.bounds(l);
+};
+
+// Duplicate a layer (or the active one). Optionally rename and hide the copy.
+PS.layer.duplicate = function (layer, newName, invisible) {
+    layer = layer || app.activeDocument.activeLayer;
+    var copy = layer.duplicate();
+    if (newName) copy.name = newName;
+    if (invisible) copy.visible = false;
+    return copy;
+};
+
+// Turn the Background layer into a normal, movable layer.
+PS.layer.unlockBackground = function (doc) {
+    doc = doc || app.activeDocument;
+    try {
+        var bg = doc.backgroundLayer;
+        if (bg) bg.isBackgroundLayer = false;
+    } catch (e) {
+        // No background layer or it is already unlocked.
+    }
+    return doc;
+};
+
+// Move a layer to the very bottom of the stack (above the background, if any).
+PS.layer.moveToBottom = function (layer, doc) {
+    doc = doc || app.activeDocument;
+    layer = layer || doc.activeLayer;
+    try {
+        layer.move(doc, ElementPlacement.PLACEATEND);
+        return layer;
+    } catch (e) {}
+    var layers = doc.layers;
+    if (layers.length) {
+        var bottom = layers[layers.length - 1];
+        if (bottom !== layer) {
+            try { layer.move(bottom, ElementPlacement.PLACEAFTER); return layer; } catch (e2) {}
+            try { layer.move(bottom, ElementPlacement.PLACEBEFORE); return layer; } catch (e3) {}
+        }
+    }
+    return layer;
 };

@@ -1,0 +1,20 @@
+{
+  "create": { "width": 1200, "height": 800, "resolution": 150, "mode": "rgb", "fill": "white", "name": "V4MaskGradient" },
+  "output": {
+    "psd": "/tmp/v4_mask_gradient.psd",
+    "jpg": "/tmp/v4_mask_gradient.jpg"
+  },
+  "report":  "/tmp/v4_mask_gradient_report.json",
+  "summary": "/tmp/v4_mask_gradient_summary.json",
+  "log":     "/tmp/v4_mask_gradient.log",
+  "operations": [
+    { "op": "log", "message": "v4 mask gradient recipe" },
+    { "op": "gradientFill", "style": "linear", "angle": 90, "from": "#0f172a", "to": "#475569", "name": "Night sky" },
+    { "op": "solidColor", "red": 22, "green": 101, "blue": 52, "name": "Meadow" },
+    { "op": "maskGradient", "startY": 460, "endY": 260, "feather": 140 },
+    { "op": "deselect" },
+    { "op": "circle", "cx": 900, "cy": 150, "r": 70, "color": "#facc15", "name": "Moon" },
+    { "op": "textAt", "contents": "MIDNIGHT MEADOW", "sizePx": 62, "font": "Arial-BoldMT", "color": "#e2e8f0", "x": 600, "y": 620, "justify": "center", "name": "Title" },
+    { "op": "log", "message": "done" }
+  ]
+}

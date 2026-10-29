@@ -4,14 +4,28 @@ A reusable, AI-friendly ExtendScript library for automating Adobe Photoshop from
 
 Tested on **Photoshop 2021–2026** (macOS).
 
-> **v3.0 is out** — hang-proof guarding, `PS.vector.*` shapes that land at exact
-> coordinates, unit conversion (cm/mm/px/pt), measured text layout, and
-> guaranteed PSD export. See [CHANGELOG.md](CHANGELOG.md) and
-> [docs/API.md → v3.0 Additions](docs/API.md#v30-additions).
+> **v4.0 is out** — reliable layer masks (error 8800 fixed), mask gradients
+> without the Gradient tool, locale-safe gradient fills, `doc.selection.selectRect`
+> / `selectOval`, inline `run.sh -e`, stdout logging, and layer utilities.
+> The v3 ergonomics (hang-proof guards, exact vector shapes, unit conversion,
+> measured text layout, guaranteed PSD export) are all still here.
+> See [CHANGELOG.md](CHANGELOG.md) and
+> [docs/API.md → v4.0 Additions](docs/API.md#v40-additions).
 
 ---
 
-## Installation
+## Download (no git needed)
+
+The easiest way to get the kit is a ready-made archive from the **Releases** page:
+
+- **https://github.com/tytytete/photoshop-automation-kit/releases**
+
+Download `photoshop-automation-kit-4.0.0.zip`, unzip it anywhere, `cd` into the
+resulting folder, and run `./tools/run.sh recipe.json`. The archive contains
+`src/` (the library), `tools/run.sh`, `examples/`, `recipes/`, `docs/` and the
+tests — everything you need, no repository checkout required.
+
+## Installation (from git)
 
 Clone the repository onto your machine:
 
@@ -23,14 +37,15 @@ The library lives at:
 
 ```
 ~/Documents/photoshop-automation-kit/
-├── AGENTS.md              ← the file AI models must read (has the v3 hard rules)
+├── AGENTS.md              ← the file AI models must read (has the v4 hard rules)
 ├── README.md              ← this file (for humans)
 ├── CHANGELOG.md           ← release notes
 ├── VERSION
-├── docs/API.md            ← full function reference incl. v3
+├── docs/API.md            ← full function reference incl. v4
 ├── src/
-│   ├── ps_core.jsx        ← the library (~80 functions, PS.* namespace)
-│   ├── ps_core_v3.jsx     ← v3 ergonomic extensions (loaded automatically)
+│   ├── ps_core.jsx        ← the library (~100 functions, PS.* namespace)
+│   ├── ps_core_v3.jsx     ← v4 ergonomic extensions (loaded automatically;
+│   │                        file name kept for backwards compatibility)
 │   └── recipe_runner.jsx  ← declarative, hang-proof recipe engine
 ├── tools/
 │   └── run.sh             ← one-command runner with a watchdog (macOS)
@@ -72,6 +87,12 @@ That's it — Photoshop opens, runs the recipe, writes `result.psd` / `result.jp
 
 To edit an existing image instead of creating a new one, replace `"create": {...}` with `"input": "/path/to/photo.jpg"`.
 
+Quick probe without creating a file (v4):
+
+```bash
+./tools/run.sh -e '$.writeln("PS " + PS.VERSION + " / Adobe " + app.version);'
+```
+
 ---
 
 ## How to use this with an AI model
@@ -89,7 +110,7 @@ So your prompt to the AI can look like:
 
 The model will:
 
-- read `AGENTS.md` (the recipe JSON whitelist + v3 hard rules),
+- read `AGENTS.md` (the recipe JSON whitelist + v4 hard rules),
 - generate a `.json` recipe,
 - run `./tools/run.sh recipe.json`,
 - optionally read the machine-readable `report.json` / `summary` output.
@@ -98,48 +119,65 @@ You never paste the library code into the chat again — you just point the mode
 
 ---
 
-## What v3 fixes (for AI agents)
+## What v4 fixes (for AI agents)
 
-| failure | v3 fix |
+| failure | v4 fix |
 |---|---|
+| `PS.mask.fromSelection` / `add` / `hide` crash with error 8800 | correct `make > channel` descriptor; works on normal/text/fill/adjustment layers; `PS.mask.has()` |
+| No way to blend two images through a mask (Gradient tool 8800) | `PS.mask.linearGradient()` paints a feathered falloff into the mask |
+| Gradient presets fail on Russian / non-English Photoshop | explicit RGB + transparency stops (`from`/`to`/`colors`) |
+| `doc.selection.selectRect / selectOval is not a function` | patched onto every document's selection; true 64-point oval |
+| `#include "src/ps_core.jsx"` → error 48 | `run.sh` strips core includes; `Folder.current` = recipe dir |
+| `$.writeln` output lost / `undefined` in the terminal | logs buffered by `PS.finish()`, printed on stdout |
+| `s2t` / `c2t` are not defined in recipes | exported as `PS.s2t` / `PS.c2t` and as globals |
+| no quick way to run a probe | `./tools/run.sh -e '…'` |
+| layer stacking / background chores | `PS.layer.duplicate`, `unlockBackground`, `moveToBottom` |
 | Photoshop hangs on a modal error dialog forever | `PS.setup()` disables dialogs; `PS.safe()` isolates risks; `run.sh` watchdog (`--timeout`) |
 | Vector shapes come out full-canvas and can't be moved | `PS.vector.*` builds shapes at exact px coordinates |
+| `PS.vector.circle` comes out as a diamond / rounded rect has a notch | correct tangent swap; circles are round |
 | mm / px / pt confusion makes geometry "float" | `PS.unit.*` + `PS.document.createSize({unit:'cm'})` |
 | Text lines stack on top of each other | `PS.layout.flow()` advances from measured bounds |
 | PSD source is dropped after exporting a JPG preview | `PS.export.auto()` + runner `autoPsd: true` |
 
-A complete v3 recipe:
+A complete v4 mask + gradient recipe:
 
 ```bash
-cat > /tmp/logo_recipe.json << 'JSON'
+cat > /tmp/blend_recipe.json << 'JSON'
 {
-  "create": { "width": 100, "height": 100, "unit": "cm", "resolution": 150,
-              "mode": "rgb", "fill": "white", "name": "Logo" },
-  "output": { "jpg": "/tmp/logo.jpg" },
+  "create": { "width": 1200, "height": 800, "resolution": 72,
+              "mode": "rgb", "fill": "white", "name": "Blend" },
+  "output": { "jpg": "/tmp/blend.jpg" },
   "autoPsd": true,
   "operations": [
-    { "op": "circle", "cx": 2953, "cy": 2953, "r": 2400, "color": "#2D4A3E", "name": "Ring" },
-    { "op": "vectorShape", "points": [[1450,3360],[2950,2060],[4450,3360]],
-      "color": "#2D4A3E", "name": "Peak" },
-    { "op": "textAt", "contents": "CAFENEUA MONTANĂ", "sizePx": 235,
-      "font": "Arial-BoldMT", "color": "#2D4A3E", "x": 2953, "y": 4750,
-      "justify": "center", "name": "Name" }
+    { "op": "solidColor", "red": 18, "green": 42, "blue": 96, "name": "Sky" },
+    { "op": "revealAllMask" },
+    { "op": "maskGradient", "startY": 320, "endY": 520, "feather": 120 },
+    { "op": "deselect" },
+    { "op": "gradientFill", "style": "linear", "angle": 90,
+      "from": "#102a60", "to": "#f2a65a", "name": "Dusk" },
+    { "op": "moveToBottom" }
   ]
 }
 JSON
 
-./tools/run.sh /tmp/logo_recipe.json      # -> logo.psd + logo.jpg
+./tools/run.sh /tmp/blend_recipe.json      # -> blend.psd + blend.jpg
 ```
 
-Self-check the kit with `tests/run_tests.sh`.
+The kit's self-check runs 51 assertions, including pixel-level mask and
+gradient checks:
+
+```bash
+./tests/run_tests.sh
+```
 
 ---
 
 ## How it works
 
-1. `src/ps_core.jsx` — the library. Provides the `PS.*` namespace for documents, selections, 15+ adjustment layers, layer styles, vector shapes, filters, fills, text, masks, transforms, and introspection.
-2. `src/recipe_runner.jsx` — a declarative runner. Reads a `RECIPE` object with an `operations` list and maps each `op` to a library call.
-3. `tools/run.sh` — concatenates `ps_core.jsx` + `recipe_runner.jsx` + your recipe and sends it to Photoshop via AppleScript.
+1. `src/ps_core.jsx` — the library. Provides the `PS.*` namespace for documents, selections, 15+ adjustment layers, layer styles, vector shapes, filters, fills, text, masks (incl. mask gradients), transforms, and introspection.
+2. `src/ps_core_v3.jsx` — v4 ergonomic extensions: guards, units, logging buffer, `PS.layer.*` utilities, selection patching.
+3. `src/recipe_runner.jsx` — a declarative runner. Reads a `RECIPE` object with an `operations` list and maps each `op` to a library call.
+4. `tools/run.sh` — concatenates `ps_core.jsx` + `ps_core_v3.jsx` + `recipe_runner.jsx` + your recipe and sends it to Photoshop via AppleScript. Supports `-e/--eval` for inline snippets.
 
 ---
 
@@ -157,10 +195,12 @@ Self-check the kit with `tests/run_tests.sh`.
 | Smart objects | `smartObject.convert`, `rasterize` |
 | Transforms | `rotateCanvas`, `flipCanvas`, `layer` (free transform) |
 | Filters | `gaussianBlur`, `motionBlur` |
-| Fills | `solidColor`, `gradient` |
-| Text | `add`, `warp`, `setTracking`, `setScale`, `setBaselineShift` |
-| Masks | `add`, `hide`, `invert`, `fromSelection` |
+| Fills | `solidColor`, `gradient` (locale-safe explicit stops) |
+| Text | `add`, `addAt`, `warp`, `bounds`, `setTracking`, `setScale`, `setBaselineShift` |
+| Masks | `fromSelection`, `add`, `hide`, `invert`, `has`, `target`, `exitTarget`, `linearGradient` |
+| Layers | `duplicate`, `unlockBackground`, `moveToBottom`, `list`, `bounds` |
 | Introspection | `PS.report()` — layer tree, dimensions, histogram |
+| CLI | `run.sh recipe.json`, `run.sh -e '…'`, `--version` |
 
 Full reference: [`docs/API.md`](docs/API.md).
 

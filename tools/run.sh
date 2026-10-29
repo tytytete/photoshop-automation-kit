@@ -7,17 +7,20 @@
 #   2) JSON recipe file ->  ./tools/run.sh recipe.json
 #      A plain .json with { input|create, output, operations, ... } — the
 #      script wraps it automatically. Preferred mode for AI agents.
+#   3) Inline JSX       ->  ./tools/run.sh -e '$.writeln(app.version);'
+#      Executes a snippet after the core library is loaded. Handy for probes.
 #
 # Optional env vars:
 #   PS_APP      Photoshop app name          (default "Adobe Photoshop 2026")
 #   REPORT      path to write a document report (JSON)
 #   PS_TIMEOUT  seconds before the run is killed as hung (default 300, 0 = off)
 #
-# What v3 adds:
-#   * hang-proof prelude injected before any recipe (no modal dialogs)
-#   * a watchdog that kills a stuck Photoshop instead of blocking forever
-#   * a cleanup trap, so the temp .jsx is never leaked on failure
-#   * clear, greppable errors and a real exit code
+# What v4 adds:
+#   * -e / --eval for inline snippets (no temp recipe file to manage)
+#   * #include "src/ps_core.jsx" in recipes is stripped automatically
+#   * Folder.current is pointed at the recipe's directory
+#   * PS.log()/$ .writeln output is returned on stdout via PS.finish()
+#   * --version
 #
 # The script concatenates core + core_v3 + runner + recipe and sends the whole
 # thing to Photoshop via the AppleScript bridge.
@@ -41,11 +44,15 @@ trap cleanup EXIT
 usage() {
     cat <<'USAGE'
 Usage: run.sh [options] recipe.jsx|recipe.json
+       run.sh -e 'inline jsx code'
+
 Options:
+  -e, --eval CODE inline JSX snippet (core library is preloaded)
   --core FILE     override core library  (default src/ps_core.jsx)
-  --core3 FILE    override v3 extensions (default src/ps_core_v3.jsx)
+  --core3 FILE    override v4 extensions (default src/ps_core_v3.jsx)
   --runner FILE   override recipe runner (default src/recipe_runner.jsx)
   --timeout SEC   watchdog timeout, 0 disables it (default 300 / $PS_TIMEOUT)
+  -v, --version   print the kit version
   -h, --help      this help
 Env: PS_APP, REPORT, PS_TIMEOUT
 USAGE
@@ -53,26 +60,58 @@ USAGE
 }
 
 RECIPE=""
+EVAL_CODE=""
+IS_EVAL=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -e|--eval)
+            [[ $# -ge 2 ]] || { echo "ERROR: $1 requires inline code" >&2; exit 2; }
+            EVAL_CODE="$2"; IS_EVAL=1; shift 2 ;;
         --core)    CORE="$2";    shift 2 ;;
         --core3)   CORE3="$2";   shift 2 ;;
         --runner)  RUNNER="$2";  shift 2 ;;
         --timeout) PS_TIMEOUT="$2"; shift 2 ;;
+        -v|--version) cat "$PROJECT_DIR/VERSION"; exit 0 ;;
         -h|--help) usage ;;
         *)         RECIPE="$1";  shift ;;
     esac
 done
 
-[[ -z "$RECIPE" ]] && usage
-[[ -f "$RECIPE" ]] || { echo "ERROR: recipe file not found: $RECIPE" >&2; exit 2; }
+if [[ "$IS_EVAL" == "1" ]]; then
+    [[ -n "$EVAL_CODE" ]] || { echo "ERROR: -e requires inline code" >&2; exit 2; }
+else
+    [[ -z "$RECIPE" ]] && usage
+    [[ -f "$RECIPE" ]] || { echo "ERROR: recipe file not found: $RECIPE" >&2; exit 2; }
+fi
 [[ -f "$CORE" ]] || { echo "ERROR: core not found: $CORE" >&2; exit 2; }
 [[ -f "$RUNNER" ]] || { echo "ERROR: runner not found: $RUNNER" >&2; exit 2; }
 
-# Hang-proof prelude: suppress native dialogs and force deterministic units.
-PRELUDE='if (typeof PS !== "undefined" && PS.setup) { PS.setup(); } else { app.displayDialogs = DialogModes.NO; }'
+# Relative paths inside recipes (File("out.psd"), non-core #includes, …)
+# resolve from the recipe's own folder, not from Photoshop's working dir.
+if [[ -n "$RECIPE" && -f "$RECIPE" ]]; then
+    RUN_BASE="$(cd "$(dirname "$RECIPE")" && pwd)"
+else
+    RUN_BASE="$PROJECT_DIR"
+fi
+RUN_BASE_JS="$(printf '%s' "$RUN_BASE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 
-# Assemble the script: core (+ v3 extensions) + runner + recipe.
+# Drop header lines that would break in the concatenated /tmp script:
+#   * #include "src/ps_core.jsx" (already prepended)
+#   * #include "src/ps_core_v3.jsx" / recipe_runner.jsx
+#   * a duplicate #target photoshop
+strip_recipe() {
+    sed -E \
+        -e '/^[[:space:]]*#include.*(ps_core|ps_core_v3|recipe_runner)/d' \
+        -e '/^[[:space:]]*#target[[:space:]]+photoshop[[:space:]]*$/d' \
+        "$1"
+}
+
+# Hang-proof prelude: point relative paths at the recipe, suppress native
+# dialogs, and force deterministic units.
+PRELUDE="try { Folder.current = new Folder(\"$RUN_BASE_JS\"); } catch (e) {}
+if (typeof PS !== \"undefined\" && PS.setup) { PS.setup(); } else { app.displayDialogs = DialogModes.NO; }"
+
+# Assemble the script: core (+ v4 extensions) + runner + recipe/eval.
 {
     echo "#target photoshop"
     cat "$CORE"
@@ -82,15 +121,20 @@ PRELUDE='if (typeof PS !== "undefined" && PS.setup) { PS.setup(); } else { app.d
     echo ""
     echo "var REPORT = \"${REPORT:-}\";"
     echo "$PRELUDE"
-    if [[ "$RECIPE" == *.json ]]; then
+    if [[ "$IS_EVAL" == "1" ]]; then
+        printf '%s\n' "$EVAL_CODE"
+    elif [[ "$RECIPE" == *.json ]]; then
         echo "var RECIPE = "
         cat "$RECIPE"
         echo ";"
         echo "if (REPORT && REPORT.length) RECIPE.report = REPORT;"
         echo "RecipeRunner.run(RECIPE);"
     else
-        cat "$RECIPE"
+        strip_recipe "$RECIPE"
     fi
+    # Return the explicit result + everything captured from PS.log/$.writeln.
+    echo ""
+    echo '(typeof PS !== "undefined" && PS.finish) ? PS.finish() : "";'
 } > "$TEMP_JSX"
 
 # --- run through the AppleScript bridge, with a watchdog --------------------

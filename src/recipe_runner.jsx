@@ -1,12 +1,12 @@
 // =============================================================================
-//  PS Recipe Runner v3 — declarative, hang-proof Photoshop automation
+//  PS Recipe Runner v4 — declarative, hang-proof Photoshop automation
 //  -----------------------------------------------------------------------------
 //  Define a global `RECIPE` object before loading this file, then run:
 //      RecipeRunner.run(RECIPE);
 //
 //  Concatenated AFTER ps_core.jsx and ps_core_v3.jsx.
 //
-//  Recipe schema (v3):
+//  Recipe schema (v4):
 //      {
 //          input:   '/path/to/input.jpg',            // OR:
 //          create:  { width, height, resolution, mode, fill, name,
@@ -28,10 +28,24 @@
 //                               font: 'ArialMT', color: [0,0,0], justify: 'center' },
 //              { op: 'textStack', x: 100, y: 200, sizePx: 32, gap: 12,
 //                               items: ['Line 1', 'Line 2', { text:'Line 3', sizePx: 20 }] },
+//              { op: 'maskGradient', startY: 500, endY: 900, feather: 200,
+//                                    direction: 'vertical', reveal: false },
+//              { op: 'duplicateLayer', name: 'Copy', invisible: false },
+//              { op: 'moveToBottom' }, { op: 'unlockBackground' },
 //              { op: 'exportAuto', base: '/path/out' },
 //              ... plus every v2 op (adjustments, styles, text, filters, ...)
 //          ]
 //      }
+//
+//  v4 behaviour changes:
+//    * every operation is still isolated; logs are returned to stdout by
+//      run.sh through PS.finish().
+//    * mask ops (maskFromSelection/revealAllMask/hideAllMask/invertMask) now
+//      work on normal, text, fill and adjustment layers.
+//    * maskGradient paints a soft falloff into the active layer mask.
+//    * gradientFill/gradientOverlay build explicit RGB stops (no localized
+//      preset names).
+//    * new layer ops: duplicateLayer, unlockBackground, moveToBottom, log.
 //
 //  v3 behaviour changes:
 //    * app.displayDialogs = DialogModes.NO is set automatically (no hang).
@@ -67,6 +81,12 @@ var RecipeRunner = (function () {
             // -- layers ---------------------------------------------
             case 'duplicate':
                 PS.duplicate(op.name); break;
+            case 'duplicateLayer':
+                PS.layer.duplicate(doc.activeLayer, op.name, op.invisible); break;
+            case 'unlockBackground':
+                PS.layer.unlockBackground(doc); break;
+            case 'moveToBottom':
+                PS.layer.moveToBottom(doc.activeLayer, doc); break;
             case 'rename':
                 PS.rename(doc.activeLayer, op.name); break;
             case 'setOpacity':
@@ -166,6 +186,24 @@ var RecipeRunner = (function () {
                 PS.mask.add(doc.activeLayer); break;
             case 'hideAllMask':
                 PS.mask.hide(doc.activeLayer); break;
+            case 'maskTarget':
+                PS.mask.target(doc.activeLayer); break;
+            case 'maskExitTarget':
+                PS.mask.exitTarget(); break;
+            case 'maskGradient':
+            case 'maskLinearGradient':
+                PS.mask.linearGradient(
+                    doc.activeLayer,
+                    op.startY !== undefined ? op.startY : op.start,
+                    op.endY !== undefined ? op.endY : op.end,
+                    op.feather,
+                    op
+                );
+                break;
+
+            // -- misc -----------------------------------------------
+            case 'log':
+                PS.log(op.message !== undefined ? op.message : op.text); break;
 
             // -- v2: layer styles -----------------------------------
             case 'dropShadow':
@@ -350,8 +388,11 @@ var RecipeRunner = (function () {
                 sf.close();
             }
 
-            // Return a primitive the AppleScript bridge can marshal.
-            return 'OK: ' + ops.length + ' ops, ' + errors.length + ' errors';
+            // Return a primitive the AppleScript bridge can marshal. PS._result
+            // is also picked up by run.sh's PS.finish() footer.
+            var result = 'OK: ' + ops.length + ' ops, ' + errors.length + ' errors';
+            PS._result = result;
+            return result;
         }
     };
 

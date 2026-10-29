@@ -7,31 +7,44 @@
 3. **Run**: `./tools/run.sh recipe.json` (macOS).
 4. The recipe schema is documented in `src/recipe_runner.jsx` header comments.
 
-## v3 hard rules (read before writing any script)
+## v4 hard rules (read before writing any script)
 
 These are the mistakes every agent makes; each one wastes minutes or hangs the app.
 
-1. **Never hand-roll ActionDescriptors for shapes.** Use `PS.vector.*`
-   (`rect`, `circle`, `polygon`, `line`, `roundedRect`, `create`) or the
-   `vectorShape`/`circle`/`rect` ops. The legacy `PS.shape.*` helpers output
-   full-canvas shapes that **cannot be moved or resized** (`transformLayer`
-   errors, `resize`/`translate` hang Photoshop).
-2. **State sizes physically.** `PS.document.createSize({ width:100, height:100,
+1. **Never hand-roll ActionDescriptors for shapes or masks.** Use `PS.vector.*`
+   (`rect`, `circle`, `polygon`, `line`, `roundedRect`, `create`) and
+   `PS.mask.*` (`fromSelection`, `add`, `hide`, `invert`, `linearGradient`).
+   Hand-written mask descriptors caused error 8800; the legacy `PS.shape.*`
+   helpers output full-canvas shapes that **cannot be moved or resized**
+   (`transformLayer` errors, `resize`/`translate` hang Photoshop).
+2. **Gradients on masks go through `PS.mask.linearGradient`** (recipe op
+   `maskGradient`), never the Gradient tool. Photoshop 2024–2026 throws 8800
+   for the interactive gradient descriptor.
+3. **Gradient fills use colours, not preset names.** `PS.fill.gradient` /
+   `gradientOverlay` accept `from`/`to` (`'#rrggbb'`) or explicit
+   `colors: [{color, location, opacity}]`. Localized preset names like
+   `'Foreground to Transparent'` break non-English Photoshop.
+4. **State sizes physically.** `PS.document.createSize({ width:100, height:100,
    unit:'cm', resolution:150 })`. Don't hand-convert mm↔px↔pt.
-3. **Pass coordinates in pixels and hex colours.** Every v3 helper (`vector.*`,
+5. **Pass coordinates in pixels and hex colours.** Every helper (`vector.*`,
    `text.addAt`, `layout.flow`) takes document pixels and `'#rrggbb'` and does
    the unit conversion for you. Text `sizePx` (not `size` — that's in points).
-4. **Never hand-compute Y baselines.** Use `PS.layout.flow` / `textStack`,
+6. **Never hand-compute Y baselines.** Use `PS.layout.flow` / `textStack`,
    which advances from measured bounds. `layer.bounds` gives real pixels.
-5. **Always write the PSD.** Use `PS.export.auto(doc, base)` or set
+7. **Always write the PSD.** Use `PS.export.auto(doc, base)` or set
    `autoPsd: true` on output with a `jpg` path.
-6. **Wrap risky calls** in `PS.safe(...)` (or rely on the runner, which
+8. **Wrap risky calls** in `PS.safe(...)` (or rely on the runner, which
    isolates every op). A thrown error without `app.displayDialogs=NO` is a
    modal dialog = a hang. The runner sets this up automatically.
-7. **Do not name a global variable `name`** — it throws in ExtendScript.
-   Do not alias `app.stringIDToTypeID` — use `PS.typeID` / `PS.charID`.
-8. `run.sh` has a watchdog: a stuck run is killed after `PS_TIMEOUT` (default
-   300 s) and reported, never blocking forever.
+9. **Do not name a global variable `name`** — it throws in ExtendScript.
+   Do not alias `app.stringIDToTypeID` — use `PS.typeID` / `PS.charID`
+   (or the exported `PS.s2t` / `PS.c2t` / global `s2t` / `c2t`).
+10. `doc.selection.selectRect` / `selectOval` now work (v4 patches each
+    document's selection); `PS.selection.*` remains the canonical form.
+11. Use `./tools/run.sh -e '…'` for quick probes; `$.writeln` and `PS.log`
+    output is returned on stdout via `PS.finish()`.
+12. `run.sh` has a watchdog: a stuck run is killed after `PS_TIMEOUT` (default
+    300 s) and reported, never blocking forever.
 
 ## Exact invocation pattern (macOS)
 
@@ -71,6 +84,14 @@ JSX
 ./tools/run.sh /tmp/my_recipe.jsx
 ```
 
+`#include "src/ps_core.jsx"` in a recipe is stripped automatically. For quick
+checks use inline mode (core + v4 are preloaded):
+
+```bash
+./tools/run.sh -e '$.writeln("PS " + PS.VERSION); $.writeln(app.version);'
+./tools/run.sh --version
+```
+
 If you don't have the repo cloned, you can still use the library directly by  
 concatenating `ps_core.jsx` + your code and piping to `osascript`:
 
@@ -87,7 +108,7 @@ A recipe is a JS object literal assigned to `var RECIPE`:
 {   
     input:    string,                     // required — path to source image  
     create:   { width, height, resolution, mode, fill, name,
-                unit: 'px'|'mm'|'cm'|'in' }, // OR create a new document (v3 unit-aware)
+                unit: 'px'|'mm'|'cm'|'in' }, // OR create a new document (unit-aware)
     output:   { psd?: string, jpg?: string, png?: string, jpgQuality?: int },
     autoPsd:  boolean,                    // derive PSD path from jpg (v3)
     log:      string,                     // run log path (v3)
@@ -98,7 +119,7 @@ A recipe is a JS object literal assigned to `var RECIPE`:
 }
 ```
 
-### v3 operation types
+### v4 operation types
 
 | op | required params | optional |
 |---|---|---|
@@ -111,10 +132,17 @@ A recipe is a JS object literal assigned to `var RECIPE`:
 | `vectorLine` | `x1 y1 x2 y2` | `thickness, color, name` |
 | `textAt` | `contents` | `sizePx, size, font, color, x, y, justify, name` |
 | `textStack` | `items: […]` | `x, y, sizePx, font, color, justify, gap` |
+| `maskGradient` / `maskLinearGradient` | `startY/start, endY/end` | `feather, direction, reveal` |
+| `duplicateLayer` | | `name, invisible` |
+| `unlockBackground` | | |
+| `moveToBottom` | | |
+| `log` | `message` | |
 | `export` | `psd/jpg/png` | `jpgQuality` |
 | `exportAuto` | `base` | `jpgQuality` |
 
 `color` accepts `[r,g,b]` or `'#rrggbb'`; `justify` is `left|center|right`.
+`gradientFill` / `gradientOverlay` accept `from` / `to` (`'#rrggbb'`) or
+`colors: [{color, location, opacity}]`; `preset` is only a hint.
 
 ### Operation types
 
@@ -123,6 +151,9 @@ Every operation has an `op` string. Optional `name: string` renames the resultin
 | op                     | required params              | optional params                    |
 |------------------------|------------------------------|------------------------------------|
 | `duplicate`            |                              | `name`                             |
+| `duplicateLayer`       |                              | `name, invisible`                  |
+| `unlockBackground`     |                              |                                    |
+| `moveToBottom`         |                              |                                    |
 | `selectSubject`        |                              |                                    |
 | `feather`              | `radius`                     |                                    |
 | `selectRect`           | `left top right bottom`      | `feather`                          |
@@ -145,12 +176,14 @@ Every operation has an `op` string. Optional `name: string` renames the resultin
 | `threshold`            | `level`                      | `name`                             |
 | `invert`               |                              | `name`                             |
 | `solidColor`           | `red green blue`            | `name`                             |
-| `gradientFill`         | `style angle preset`        | `name`                             |
+| `gradientFill`         | `style angle`               | `from to colors name scale reverse` |
 | `text`                 | `contents`                   | `size font color position name`    |
 | `warpText`             | `style bend`                 | `horzDist vertDist`                |
 | `setOpacity`           | `value`                      |                                    |
 | `setBlendMode`         | `mode`                       |                                    |
-| `maskFromSelection` / `revealAllMask` / `hideAllMask` / `invertMask` | | |
+| `maskFromSelection` / `revealAllMask` / `hideAllMask` / `invertMask` / `maskTarget` / `maskExitTarget` | | |
+| `maskGradient` / `maskLinearGradient` | `startY/start endY/end` | `feather direction reveal` |
+| `log`                  | `message`                    |                                    |
 | `dropShadow` / `innerShadow` / `outerGlow` / `innerGlow` / `colorOverlay` / `gradientOverlay` / `bevel` / `stroke` / `clearLayerStyle` | style-specific | see API.md |
 | `rectangle` / `roundedRect` / `ellipse` / `triangle` / `polygon` / `line` | `color` | `name` |
 | `smartObject` / `rasterize(type)` | | |
@@ -176,11 +209,14 @@ write regular ExtendScript using the `PS.*` namespace directly. See
   become the mask of the NEXT adjustment or fill layer created.
 - All adjustment parameters use the same ranges as the Photoshop UI (hue in  
   degrees, saturation/lightness in ±, levels in 0–255, etc.).
-- `run.sh` accepts `--timeout SEC` (watchdog) and `PS_TIMEOUT` (default 300 s).
-- Validate your work with `tests/run_tests.sh` (16 assertions on the v3 helpers).
+- `run.sh` accepts `--timeout SEC` (watchdog), `-e/--eval`, `--version`, and
+  `PS_TIMEOUT` (default 300 s).
+- Validate your work with `tests/run_tests.sh` (51 assertions on the v3/v4
+  helpers, including pixel checks for masks and gradients).
 - Real builds to copy from: `examples/mountain_cafe_logo.jsx`,
-  `examples/mountain_cafe_menu.jsx`.
-- Full v3 reference and the pitfall list: `docs/API.md` → "v3.0 Additions".
+  `examples/mountain_cafe_menu.jsx`, `examples/v4_mask_showcase.jsx`,
+  `recipes/v4_mask_gradient.json`.
+- Full reference and the pitfall list: `docs/API.md` → "v4.0 Additions".
 
 ## Pitfalls (learned the hard way — see docs/API.md)
 
@@ -190,8 +226,15 @@ write regular ExtendScript using the `PS.*` namespace directly. See
 | `General Photoshop error … source rectangle is empty` | `transformLayer` on a shape layer | use `PS.vector.*` (no transforms needed) |
 | Photoshop freezes on `layer.resize` / `layer.translate` | those DOM calls hang on vector layers | same as above |
 | shape ends up full-canvas | `PS.shape.*` legacy behaviour | pass `cfg.bounds` or use `PS.vector.*` |
+| circle looks like a diamond / rounded rect has a notch | path-point tangent order | fixed in v4; use `PS.vector.circle` / `roundedRect` |
 | geometry scaled by ~2× (e.g. 150 ppi) | path anchors are in points, scaled by `resolution/72` | use `PS.unit.*` / `PS.vector.*` (auto-converted) |
 | `global.stringIDToTypeID() … not getting correct parameters` | aliasing `var s2t = app.stringIDToTypeID` loses `this` | use `PS.typeID` / `PS.charID` |
 | `TypeError: undefined is not an object` on a text layer | top-level `var name = …` — `name` is reserved | rename the variable |
 | text lines overlap | hand-computed baselines | `PS.layout.flow()` / `textStack` |
 | `.jpg` saved but no `.psd` | export called with jpg only | `PS.export.auto()` or `autoPsd: true` |
+| error 8800 on "Make" when masking | hand-rolled mask descriptor (`null` key / `revealSelection`) | `PS.mask.fromSelection()` / `add()` / `hide()` |
+| gradient tool error 8800 on a mask | interactive gradient descriptor changed in 2024–2026 | `PS.mask.linearGradient()` / `maskGradient` |
+| gradient preset ignored on RU/non-EN PS | localized preset name string | pass `from`/`to`/`colors` instead |
+| error 48 on `#include "src/ps_core.jsx"` | temp script lives in /tmp | run via `run.sh` (it strips core includes) |
+| `$.writeln` prints `undefined` | `do javascript` returns only the final value | run via `run.sh`; logs are returned by `PS.finish()` |
+| `doc.selection.selectRect is not a function` | native DOM only has `select()` | v4 patches it; or use `PS.selection.selectRect()` |

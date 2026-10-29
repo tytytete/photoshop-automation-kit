@@ -35,11 +35,15 @@ PS.charID = function (s) { return charIDToTypeID(s); };
 
     // ---------------- DOCUMENTS ----------------
     PS.openDocument = function (path) {
-        return app.open(File(path));
+        var doc = app.open(File(path));
+        try { PS.patchSelection(doc); } catch (e) {}
+        return doc;
     };
 
     PS.activeDocument = function () {
-        return app.activeDocument;
+        var doc = app.activeDocument;
+        try { PS.patchSelection(doc); } catch (e) {}
+        return doc;
     };
 
     PS.close = function (doc, saveChanges) {
@@ -165,16 +169,31 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         executeAction(c2t('setd'), d, DialogModes.NO);
     };
 
+    // 64-point ellipse approximation (the DOM has no native oval selector).
+    PS._ovalPoints = function (l, t, r, b) {
+        var cx = (l + r) / 2, cy = (t + b) / 2;
+        var rx = (r - l) / 2, ry = (b - t) / 2;
+        var pts = [], n = 64, i, a;
+        for (i = 0; i < n; i++) {
+            a = 2 * Math.PI * i / n;
+            pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+        }
+        return pts;
+    };
+
+    // Select hard, then feather the live selection. Passing feather directly
+    // to Selection.select() leaves semi-transparent interiors on current
+    // Photoshop builds (notably when the target is a layer mask).
     PS.selection.selectRect = function (l, t, r, b, feather) {
-        var f = feather || 0;
-        app.activeDocument.selection.select([[l, t], [r, t], [r, b], [l, b]],
-            SelectionType.REPLACE, f, false);
+        var sel = app.activeDocument.selection;
+        sel.select([[l, t], [r, t], [r, b], [l, b]], SelectionType.REPLACE, 0, false);
+        if (feather) sel.feather(feather);
     };
 
     PS.selection.selectOval = function (l, t, r, b, feather) {
-        var f = feather || 0;
-        app.activeDocument.selection.select([[l, t], [r, t], [r, b], [l, b]],
-            SelectionType.REPLACE, f, true);
+        var sel = app.activeDocument.selection;
+        sel.select(PS._ovalPoints(l, t, r, b), SelectionType.REPLACE, 0, true);
+        if (feather) sel.feather(feather);
     };
 
     // AI subject detection — returns true on success, false if the AI model
@@ -490,64 +509,220 @@ PS.charID = function (s) { return charIDToTypeID(s); };
     // ---------------- LAYER MASKS ----------------
     PS.mask = {};
 
+    // True when the active layer has a pixel (user) mask.
+    PS.mask.has = function (layer) {
+        var doc = app.activeDocument;
+        try { if (layer) doc.activeLayer = layer; } catch (e) { return false; }
+        var ref = new ActionReference();
+        ref.putEnumerated(c2t('Lyr '), c2t('Ordn'), c2t('Trgt'));
+        try {
+            var desc = executeActionGet(ref);
+            return !!desc.getBoolean(s2t('hasUserMask'));
+        } catch (e) {
+            return false;
+        }
+    };
+
+    // Internal: create a mask with the given userMaskEnabled mode.
+    // using ∈ 'revealAll' | 'hideAll' | 'revealSelection'.
+    //
+    // The ActionManager contract for "Mk > channel" is:
+    //   * new = channel          (WHAT to create)
+    //   * at  = channel/mask ref (WHERE to attach it)
+    // Using the legacy `null` key here raises error 8800.
+    PS.mask._make = function (layer, using) {
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
+        var desc = new ActionDescriptor();
+        desc.putClass(s2t('new'), s2t('channel'));
+        var ref = new ActionReference();
+        ref.putEnumerated(s2t('channel'), s2t('channel'), s2t('mask'));
+        desc.putReference(s2t('at'), ref);
+        desc.putEnumerated(s2t('using'), s2t('userMaskEnabled'), s2t(using));
+        executeAction(s2t('make'), desc, DialogModes.NO);
+        return layer || doc.activeLayer;
+    };
+
+    // Fill the whole existing mask with white (255) or black (0).
+    // Adjustment/fill/text layers created by Photoshop already own an internal
+    // user mask, so "adding" a second one is impossible — we reset that mask.
+    PS.mask._fill = function (layer, value) {
+        var doc = app.activeDocument;
+        PS.mask.target(layer);
+        try {
+            var c = new SolidColor();
+            c.rgb.red = value; c.rgb.green = value; c.rgb.blue = value;
+            doc.selection.selectAll();
+            doc.selection.fill(c, ColorBlendMode.NORMAL, 100, false);
+            doc.selection.deselect();
+        } finally {
+            PS.mask.exitTarget();
+        }
+    };
+
     // Create a mask from the current selection on the given layer.
     PS.mask.fromSelection = function (layer) {
-        // When an adjustment/fill layer is created with an active selection,
-        // Photoshop auto-generates the mask. For a normal layer call add().
-        if (layer && layer.kind === LayerKind.NORMAL) {
-            app.activeDocument.activeLayer = layer;
-            var d = new ActionDescriptor();
-            var r = new ActionReference();
-            r.putEnumerated(s2t('channel'), s2t('channel'), s2t('mask'));
-            d.putReference(s2t('null'), r);
-            d.putEnumerated(s2t('using'), s2t('userMaskEnabled'), s2t('revealSelection'));
-            executeAction(s2t('make'), d, DialogModes.NO);
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
+        var hasSelection = true;
+        try {
+            var b = doc.selection.bounds;
+            hasSelection = !!(b && b.length === 4);
+        } catch (e) {
+            hasSelection = false;
+        }
+        // No active selection: a reveal-all mask is the sensible fallback.
+        if (!hasSelection) return PS.mask.add(layer);
+
+        // Stash the selection before PS.mask.add() may replace it with a
+        // select-all on the mask channel.
+        var chName = '__ps_mask_tmp_' + (PS._maskTmp = (PS._maskTmp || 0) + 1);
+        var ch = null;
+        try {
+            ch = PS.selection.store(chName);
+            // Ensures a fully white mask, whether the layer had one already
+            // (content layers always do) or needs a new one.
+            PS.mask.add(layer);
+            PS.mask.target(layer);
+            doc.selection.selectAll();
+            var black = new SolidColor();
+            black.rgb.red = 0; black.rgb.green = 0; black.rgb.blue = 0;
+            doc.selection.fill(black, ColorBlendMode.NORMAL, 100, false);
+            PS.selection.load(ch, SelectionType.REPLACE, false);
+            var white = new SolidColor();
+            white.rgb.red = 255; white.rgb.green = 255; white.rgb.blue = 255;
+            doc.selection.fill(white, ColorBlendMode.NORMAL, 100, false);
+            doc.selection.deselect();
+        } finally {
+            PS.mask.exitTarget();
+            if (ch) { try { ch.remove(); } catch (e) {} }
         }
         return layer;
     };
 
-    PS.mask.invert = function (layer) {
-        app.activeDocument.activeLayer = layer || app.activeDocument.activeLayer;
-        executeAction(s2t('invert'), new ActionDescriptor(), DialogModes.NO);
+    // Reveal-all mask (white). Resets an existing mask instead of adding a
+    // second one (Photoshop forbids two pixel masks on one layer).
+    PS.mask.add = function (layer) {
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
+        if (!PS.mask.has(layer)) PS.mask._make(layer, 'revealAll');
+        // Force white: creating a mask while a selection is active can yield a
+        // black/hidden mask on current builds.
+        PS.mask._fill(layer, 255);
+        return layer || doc.activeLayer;
     };
 
-    // v2.0 — quick mask ops built on primitives already confirmed working.
-    PS.mask.add = function (layer) {
-        var d = app.activeDocument;
-        var activeLayer = layer || d.activeLayer;
-        d.activeLayer = activeLayer;
-        // Reveal-all: select all, create mask, clear selection.
-        d.selection.selectAll();
-        PS.mask.fromSelection(activeLayer);
-        d.selection.deselect();
-        return activeLayer;
-    };
+    // Hide-all mask (black) — also handles layers that already have a mask.
     PS.mask.hide = function (layer) {
-        var d = app.activeDocument;
-        var activeLayer = layer || d.activeLayer;
-        d.activeLayer = activeLayer;
-        d.selection.selectAll();
-        // Hide-all mask: reveal the selection then invert the mask pixels.
-        PS.mask.fromSelection(activeLayer);
-        d.selection.deselect();
-        try { PS.mask.invert(activeLayer); } catch (_) {}
-        return activeLayer;
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
+        if (!PS.mask.has(layer)) PS.mask._make(layer, 'hideAll');
+        PS.mask._fill(layer, 0);
+        return layer || doc.activeLayer;
     };
-    PS.mask.invert = function (layer) {
-        app.activeDocument.activeLayer = layer || app.activeDocument.activeLayer;
-        // Invert the mask by targeting it as the active channel.
+
+    // Target the active layer's mask channel so pixel edits (fill/blur/invert)
+    // affect the mask, not the layer content.
+    PS.mask.target = function (layer) {
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
         var desc = new ActionDescriptor();
         var ref = new ActionReference();
-        ref.putEnumerated(s2t('channel'), s2t('ordinal'), s2t('targetEnum'));
-        desc.putReference(s2t('null'), ref);
-        desc.putEnumerated(s2t('to'), s2t('ordinal'), s2t('targetEnum'));
-        try {
-            executeAction(s2t('invert'), desc, DialogModes.NO);
-        } catch (e) {
-            // Fallback: invert current selection (best-effort).
-            try { executeAction(s2t('invert'), new ActionDescriptor(), DialogModes.NO); } catch (_) {}
-        }
+        ref.putEnumerated(c2t('Chnl'), c2t('Chnl'), c2t('Msk '));
+        desc.putReference(c2t('null'), ref);
+        desc.putBoolean(c2t('MkVs'), true);
+        executeAction(c2t('slct'), desc, DialogModes.NO);
+        return doc.activeLayer;
     };
+
+    // Return from the mask channel to the composite RGB channel.
+    PS.mask.exitTarget = function () {
+        var desc = new ActionDescriptor();
+        var ref = new ActionReference();
+        ref.putEnumerated(c2t('Chnl'), c2t('Chnl'), c2t('RGB '));
+        desc.putReference(c2t('null'), ref);
+        try { executeAction(c2t('slct'), desc, DialogModes.NO); } catch (e) {}
+    };
+
+    PS.mask.invert = function (layer) {
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
+        PS.mask.target();
+        try { PS.selection.deselect(); } catch (e) {}
+        try {
+            executeAction(s2t('invert'), new ActionDescriptor(), DialogModes.NO);
+        } catch (e1) {
+            // Fallback for older builds: explicit channel reference.
+            var desc = new ActionDescriptor();
+            var ref = new ActionReference();
+            ref.putEnumerated(c2t('Chnl'), c2t('Chnl'), c2t('Msk '));
+            desc.putReference(c2t('null'), ref);
+            executeAction(c2t('Invr'), desc, DialogModes.NO);
+        }
+        PS.mask.exitTarget();
+        return layer || doc.activeLayer;
+    };
+
+    // Paint a soft linear falloff directly into the layer mask.
+    //   startY / endY : document pixels along the chosen axis.
+    //   start is the 50% boundary; |end - start| is the feather width and the
+    //   sign selects the direction (end > start = fade down / right).
+    //   opts.direction : 'vertical' (default) | 'horizontal'
+    //   opts.reveal    : paint white (reveal) instead of black (hide)
+    //
+    // This uses a feathered selection fill — not the Gradient tool — so it
+    // works on every Photoshop version and never trips the 8800 descriptor
+    // changes introduced in 2024–2026.
+    PS.mask.linearGradient = function (layer, startY, endY, featherRadius, opts) {
+        opts = opts || {};
+        var doc = app.activeDocument;
+        if (layer) doc.activeLayer = layer;
+        if (!PS.mask.has(doc.activeLayer)) PS.mask.add(doc.activeLayer);
+
+        var w = doc.width.as('px');
+        var h = doc.height.as('px');
+        var f = (featherRadius === undefined || featherRadius === null)
+            ? Math.abs(endY - startY) : featherRadius;
+        f = Math.max(0, Math.round(f));
+
+        var horizontal = String(opts.direction || 'vertical').toLowerCase() === 'horizontal';
+        var start = Number(startY);
+        var end = Number(endY);
+        var limit = horizontal ? w : h;
+        start = Math.max(0, Math.min(limit, start));
+        end = Math.max(0, Math.min(limit, end));
+
+        var pts;
+        if (end >= start) {
+            pts = horizontal
+                ? [[start, 0], [w, 0], [w, h], [start, h]]
+                : [[0, start], [w, start], [w, h], [0, h]];
+        } else {
+            pts = horizontal
+                ? [[0, 0], [start, 0], [start, h], [0, h]]
+                : [[0, 0], [w, 0], [w, start], [0, start]];
+        }
+
+        PS.mask.target();
+        try {
+            // Select hard, then feather the live selection. Passing feather to
+            // Selection.select() leaves the mask interior semi-transparent on
+            // current Photoshop builds; the two-step form is reliable.
+            doc.selection.select(pts, SelectionType.REPLACE, 0, false);
+            if (f > 0) doc.selection.feather(f);
+            var v = opts.reveal ? 255 : 0;
+            var c = new SolidColor();
+            c.rgb.red = v; c.rgb.green = v; c.rgb.blue = v;
+            doc.selection.fill(c, ColorBlendMode.NORMAL, 100, false);
+            doc.selection.deselect();
+        } finally {
+            PS.mask.exitTarget();
+        }
+        return layer || doc.activeLayer;
+    };
+
+    // Alias used by recipes / agents.
+    PS.mask.gradient = PS.mask.linearGradient;
 
     // ---------------- v2.0: DOCUMENT CREATION & CANVAS ----------------
     PS.document = {};
@@ -563,6 +738,7 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         try { fillMap.bgColor = DocumentFill.BACKGROUNDCOLOR; } catch(_) {}
         var fill = fillMap[(cfg.fill || 'transparent').toLowerCase()] || DocumentFill.TRANSPARENT;
         var d = app.documents.add(w, h, res, cfg.name || 'Untitled', mode, fill, 1);
+        try { PS.patchSelection(d); } catch (e) {}
         return d;
     };
 
@@ -621,6 +797,12 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         d.putDouble(c2t('Rd  '), r || 0); d.putDouble(c2t('Grn '), g || 0); d.putDouble(c2t('Bl  '), b || 0);
         return d;
     };
+    // Accept '#rrggbb' or [r,g,b] for any layer-style colour argument.
+    PS._colorTriplet = function (c, def) {
+        if (typeof c === 'string') return PS._rgbOf(c);
+        if (c && c.length >= 3) return [c[0], c[1], c[2]];
+        return def || [0, 0, 0];
+    };
 
     PS.layerStyle.dropShadow = function (cfg) {
         var sh = new ActionDescriptor();
@@ -631,7 +813,8 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         sh.putInteger(c2t('Dstn'), cfg.distance !== undefined ? cfg.distance : 8);
         sh.putInteger(c2t('Ckmt'), cfg.spread !== undefined ? cfg.spread : 0);
         sh.putInteger(c2t('blur'), cfg.size !== undefined ? cfg.size : 15);
-        sh.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color ? cfg.color[0] : 0, cfg.color ? cfg.color[1] : 0, cfg.color ? cfg.color[2] : 0));
+        var dscol = PS._colorTriplet(cfg.color, [0, 0, 0]);
+        sh.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(dscol[0], dscol[1], dscol[2]));
         PS._applyStyleFx(c2t('DrSh'), sh);
         return app.activeDocument.activeLayer;
     };
@@ -641,7 +824,8 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         st.putBoolean(c2t('enab'), true);
         st.putEnumerated(c2t('Styl'), c2t('FStl'), (cfg.position === 'inside' ? c2t('InsF') : cfg.position === 'center' ? c2t('CtrF') : c2t('OutF')));
         st.putInteger(c2t('Sz  '), cfg.size !== undefined ? cfg.size : 3);
-        st.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color ? cfg.color[0] : 255, cfg.color ? cfg.color[1] : 0, cfg.color ? cfg.color[2] : 0));
+        var stcol = PS._colorTriplet(cfg.color, [255, 0, 0]);
+        st.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(stcol[0], stcol[1], stcol[2]));
         PS._applyStyleFx(c2t('FrFX'), st);
         return app.activeDocument.activeLayer;
     };
@@ -654,13 +838,14 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         sh.putInteger(c2t('Dstn'), cfg.distance !== undefined ? cfg.distance : 5);
         sh.putInteger(c2t('Ckmt'), cfg.choke !== undefined ? cfg.choke : 0);
         sh.putInteger(c2t('blur'), cfg.size !== undefined ? cfg.size : 10);
-        sh.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color ? cfg.color[0] : 0, cfg.color ? cfg.color[1] : 0, cfg.color ? cfg.color[2] : 0));
+        var iscol = PS._colorTriplet(cfg.color, [0, 0, 0]);
+        sh.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(iscol[0], iscol[1], iscol[2]));
         PS._applyStyleFx(c2t('IrSh'), sh);
         return app.activeDocument.activeLayer;
     };
     PS.layerStyle.outerGlow = function (cfg) {
         var g = new ActionDescriptor();
-        var col = cfg.color || [255, 200, 0];
+        var col = PS._colorTriplet(cfg.color, [255, 200, 0]);
         g.putBoolean(c2t('enab'), true);
         g.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 70);
         g.putInteger(c2t('Sprd'), cfg.spread !== undefined ? cfg.spread : 0);
@@ -671,7 +856,7 @@ PS.charID = function (s) { return charIDToTypeID(s); };
     };
     PS.layerStyle.innerGlow = function (cfg) {
         var g = new ActionDescriptor();
-        var col = cfg.color || [0, 120, 255];
+        var col = PS._colorTriplet(cfg.color, [0, 120, 255]);
         g.putBoolean(c2t('enab'), true);
         g.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 70);
         g.putInteger(c2t('Ckmt'), cfg.choke !== undefined ? cfg.choke : 0);
@@ -682,7 +867,7 @@ PS.charID = function (s) { return charIDToTypeID(s); };
     };
     PS.layerStyle.colorOverlay = function (cfg) {
         var o = new ActionDescriptor();
-        var col = cfg.color || [30, 144, 255];
+        var col = PS._colorTriplet(cfg.color, [30, 144, 255]);
         o.putBoolean(c2t('enab'), true);
         o.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 100);
         o.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(col[0], col[1], col[2]));
@@ -694,18 +879,23 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         var b = new ActionDescriptor();
         b.putBoolean(c2t('enab'), true);
         b.putEnumerated(c2t('bvlS'), c2t('BESl'), c2t('SfBL')); // inner bevel
-        if (cfg && cfg.color) b.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(cfg.color[0], cfg.color[1], cfg.color[2]));
+        if (cfg && cfg.color) { var bcol = PS._colorTriplet(cfg.color, [0, 0, 0]); b.putObject(c2t('Clr '), c2t('RGBC'), PS._rgba(bcol[0], bcol[1], bcol[2])); }
         PS._applyStyleFx(c2t('ebbl'), b);
         return app.activeDocument.activeLayer;
     };
 
     PS.layerStyle.gradientOverlay = function (cfg) {
+        cfg = cfg || {};
         var g = new ActionDescriptor();
         g.putBoolean(c2t('enab'), true);
         g.putInteger(c2t('Opct'), cfg.opacity !== undefined ? cfg.opacity : 100);
-        var grad = new ActionDescriptor();
-        grad.putString(s2t('name'), (cfg && cfg.preset) || 'Foreground to Background');
-        g.putObject(c2t('Grad'), s2t('Grdn'), grad);
+        var gcfg = {};
+        for (var k in cfg) gcfg[k] = cfg[k];
+        // Locale-safe default: explicit foreground -> background RGB stops.
+        if (!gcfg.preset && !gcfg.colors && gcfg.to === undefined) {
+            gcfg.preset = 'Foreground to Background';
+        }
+        g.putObject(c2t('Grad'), s2t('Grdn'), PS._gradientDescriptor(gcfg));
         PS._applyStyleFx(c2t('GrFl'), g);
         return app.activeDocument.activeLayer;
     };
@@ -834,8 +1024,123 @@ PS.charID = function (s) { return charIDToTypeID(s); };
     };
     PS.text.setBaselineShift = function (layer, val) { layer.textItem.baselineShift = val; };
 
+    // ---------------- LOCALE-SAFE GRADIENTS ----------------
+    // Gradient preset names are localized ("Foreground to Transparent" is
+    // "От основного к прозрачному" in Russian Photoshop), so a string name in
+    // the descriptor fails or is ignored on non-English installs. We always
+    // build explicit RGB colour stops + transparency stops instead.
+
+    PS._rgbOf = function (c) {
+        if (typeof c === 'string') {
+            var h = String(c).replace('#', '');
+            if (h.length === 3) {
+                h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+            }
+            return [parseInt(h.substr(0, 2), 16) || 0,
+                    parseInt(h.substr(2, 2), 16) || 0,
+                    parseInt(h.substr(4, 2), 16) || 0];
+        }
+        if (c && c.length >= 3) return [c[0], c[1], c[2]];
+        return [0, 0, 0];
+    };
+
+    // Normalize cfg to a list of { color:[r,g,b], location:0..1, opacity:0..100 }.
+    PS._gradientStops = function (cfg) {
+        cfg = cfg || {};
+        var stops = [];
+        var i, s;
+        if (cfg.colors && cfg.colors.length) {
+            for (i = 0; i < cfg.colors.length; i++) {
+                s = cfg.colors[i];
+                if (typeof s !== 'object' || s === null) s = { color: s };
+                stops.push({
+                    color: PS._rgbOf(s.color !== undefined ? s.color : s.rgb),
+                    location: s.location !== undefined
+                        ? s.location
+                        : (cfg.colors.length > 1 ? i / (cfg.colors.length - 1) : 0),
+                    opacity: s.opacity !== undefined ? s.opacity : 100
+                });
+            }
+            return stops;
+        }
+
+        var fg = app.foregroundColor;
+        var bg = app.backgroundColor;
+        var fgRgb = [fg.rgb.red, fg.rgb.green, fg.rgb.blue];
+        var bgRgb = [bg.rgb.red, bg.rgb.green, bg.rgb.blue];
+        if (cfg.from !== undefined) fgRgb = PS._rgbOf(cfg.from);
+        if (cfg.to !== undefined) bgRgb = PS._rgbOf(cfg.to);
+
+        var preset = String(cfg.preset || '').toLowerCase();
+        var toTransparent = preset.indexOf('transparent') >= 0 ||
+                            (cfg.toOpacity !== undefined && cfg.toOpacity === 0);
+        var toBackground = preset.indexOf('background') >= 0 || cfg.to !== undefined;
+        if (preset.indexOf('black') >= 0 && preset.indexOf('white') >= 0) {
+            fgRgb = [0, 0, 0];
+            bgRgb = [255, 255, 255];
+            toBackground = true;
+        }
+
+        stops.push({
+            color: fgRgb,
+            location: 0,
+            opacity: cfg.fromOpacity !== undefined ? cfg.fromOpacity : 100
+        });
+        stops.push({
+            color: toBackground ? bgRgb : fgRgb,
+            location: 1,
+            opacity: toTransparent
+                ? (cfg.toOpacity !== undefined ? cfg.toOpacity : 0)
+                : (cfg.toOpacity !== undefined ? cfg.toOpacity : 100)
+        });
+        return stops;
+    };
+
+    // Build a gradientClass ActionDescriptor from explicit stops.
+    PS._gradientDescriptor = function (cfg) {
+        var grad = new ActionDescriptor();
+        grad.putString(s2t('name'), 'KitGradient');
+        grad.putEnumerated(s2t('gradientForm'), s2t('gradientForm'), s2t('customStops'));
+
+        var stops = PS._gradientStops(cfg);
+        var colorList = new ActionList();
+        var transparencyList = new ActionList();
+        var i, stop, cs, ts, c, loc;
+        for (i = 0; i < stops.length; i++) {
+            stop = stops[i];
+            loc = Math.round(stop.location * 4096);
+
+            cs = new ActionDescriptor();
+            c = new ActionDescriptor();
+            c.putDouble(s2t('red'), stop.color[0]);
+            c.putDouble(s2t('grain'), stop.color[1]);
+            c.putDouble(s2t('blue'), stop.color[2]);
+            cs.putObject(s2t('color'), s2t('RGBColor'), c);
+            cs.putEnumerated(s2t('type'), s2t('colorStopType'), s2t('userStop'));
+            cs.putInteger(s2t('location'), loc);
+            cs.putInteger(s2t('midpoint'), 50);
+            colorList.putObject(s2t('colorStop'), cs);
+
+            ts = new ActionDescriptor();
+            ts.putUnitDouble(s2t('opacity'), s2t('percentUnit'), stop.opacity);
+            ts.putInteger(s2t('location'), loc);
+            ts.putInteger(s2t('midpoint'), 50);
+            transparencyList.putObject(s2t('transparencyStop'), ts);
+        }
+        grad.putList(s2t('colors'), colorList);
+        grad.putList(s2t('transparency'), transparencyList);
+        return grad;
+    };
+
     // ---------------- v2.0: GRADIENT FILL LAYER ----------------
+    // cfg: { style, angle, scale, reverse, name,
+    //        from, to, fromOpacity, toOpacity,        // explicit colours
+    //        colors: [{color, location, opacity}] }   // full custom stops
+    // `preset` is still accepted as a hint ('foreground to transparent',
+    // 'foreground to background', 'black, white'), but is never passed to
+    // Photoshop by name.
     PS.fill.gradient = function (cfg) {
+        cfg = cfg || {};
         var desc = new ActionDescriptor(); var ref = new ActionReference();
         ref.putClass(s2t('contentLayer')); desc.putReference(s2t('null'), ref);
         var using = new ActionDescriptor(), typeD = new ActionDescriptor();
@@ -844,9 +1149,13 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         typeD.putDouble(s2t('angle'), cfg.angle !== undefined ? cfg.angle : 0);
         if (cfg.scale !== undefined) typeD.putDouble(s2t('scale'), cfg.scale);
         typeD.putBoolean(s2t('reverse'), !!cfg.reverse);
-        var grad = new ActionDescriptor();
-        grad.putString(s2t('name'), cfg.preset || 'Foreground to Transparent');
-        typeD.putObject(s2t('gradient'), s2t('gradientClass'), grad);
+
+        var gcfg = {};
+        for (var k in cfg) gcfg[k] = cfg[k];
+        if (!gcfg.preset && !gcfg.colors && gcfg.to === undefined) {
+            gcfg.preset = 'Foreground to Transparent';
+        }
+        typeD.putObject(s2t('gradient'), s2t('gradientClass'), PS._gradientDescriptor(gcfg));
         using.putObject(s2t('type'), s2t('gradientLayer'), typeD);
         desc.putObject(s2t('using'), s2t('contentLayer'), using);
         executeAction(s2t('make'), desc, DialogModes.NO);
@@ -890,7 +1199,8 @@ PS.charID = function (s) { return charIDToTypeID(s); };
             return node;
         }
         var layerTree = [];
-        for (var i = d.artLayers.length - 1; i >= 0; i--) layerTree.push(buildTree(d.artLayers[i]));
+        // artLayers[0] is the topmost layer; report top -> bottom.
+        for (var i = 0; i < d.artLayers.length; i++) layerTree.push(buildTree(d.artLayers[i]));
         var hRaw = '';
         try { hRaw = String(d.histogram || ''); } catch (_) { hRaw = ''; }
         var report = {
@@ -906,4 +1216,46 @@ PS.charID = function (s) { return charIDToTypeID(s); };
         return report;
     };
 
+    // ---------------- v4: expose low-level type-id helpers ----------------
+    // Recipes often need a one-off ActionManager descriptor. Keep the helpers
+    // reachable without re-implementing the closure-bound wrappers.
+    PS.s2t = s2t;
+    PS.c2t = c2t;
+
+    // ---------------- v4: Selection ergonomics ----------------
+    // The native DOM only has Selection.select(points); agents instinctively
+    // write doc.selection.selectRect(...). ExtendScript has no global
+    // `Selection` constructor, but the live Selection object accepts
+    // expando methods — so patch each document's selection instance.
+    PS.patchSelection = function (doc) {
+        doc = doc || (app.documents.length ? app.activeDocument : null);
+        if (!doc) return false;
+        try {
+            var sel = doc.selection;
+            if (!sel.selectRect) {
+                sel.selectRect = function (l, t, r, b, feather) {
+                    doc.selection.select([[l, t], [r, t], [r, b], [l, b]],
+                        SelectionType.REPLACE, 0, false);
+                    if (feather) doc.selection.feather(feather);
+                };
+            }
+            if (!sel.selectOval) {
+                sel.selectOval = function (l, t, r, b, feather) {
+                    doc.selection.select(PS._ovalPoints(l, t, r, b),
+                        SelectionType.REPLACE, 0, true);
+                    if (feather) doc.selection.feather(feather);
+                };
+            }
+            return true;
+        } catch (e) {
+            // Host may forbid expando methods — PS.selection still works.
+            return false;
+        }
+    };
+    PS.patchSelection();
+
 })();
+
+// v4: also expose the type-id helpers globally (handy in ad-hoc -e snippets).
+try { if (typeof s2t === 'undefined') s2t = PS.s2t; } catch (e) {}
+try { if (typeof c2t === 'undefined') c2t = PS.c2t; } catch (e) {}
